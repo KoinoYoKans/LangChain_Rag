@@ -1,0 +1,16 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.1
+python-multipart>=0.0.9
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langchain-postgres>=0.0.12
+langchain-text-splitters>=0.3.0
+psycopg[binary]>=3.2.0
+dashscope>=1.20.0
+pypdf>=4.3.0
+python-docx>=1.1.2
+sentence-transformers>=3.0.0
+torch>=2.3.0
+transformers>=4.51.0
