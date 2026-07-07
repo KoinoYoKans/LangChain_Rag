@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -22,6 +23,25 @@ def _as_bool(name: str, default: bool) -> bool:
     if value is None or value == "":
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _build_postgres_dsn() -> str | None:
+    explicit_dsn = os.getenv("POSTGRES_DSN")
+    if explicit_dsn:
+        return explicit_dsn
+
+    host = os.getenv("PG_HOST")
+    user = os.getenv("PG_USER")
+    password = os.getenv("PG_PWD")
+    database = os.getenv("PG_DATABASE", "postgres")
+    sslmode = os.getenv("PG_SSLMODE")
+    if not host or not user or password is None:
+        return None
+
+    dsn = f"postgresql+psycopg://{quote_plus(user)}:{quote_plus(password)}@{host}/{database}"
+    if sslmode:
+        dsn = f"{dsn}?sslmode={quote_plus(sslmode)}"
+    return dsn
 
 
 @dataclass(frozen=True)
@@ -91,7 +111,7 @@ class AppSettings:
             qwen_rerank_model=os.getenv("QWEN_RERANK_MODEL", "gte-rerank-v2"),
             embedding_dimension=_as_int("EMBEDDING_DIMENSION", 1024),
             embedding_batch_size=_as_int("EMBEDDING_BATCH_SIZE", 16),
-            postgres_dsn=os.getenv("POSTGRES_DSN"),
+            postgres_dsn=_build_postgres_dsn(),
             pgvector_table=os.getenv("PGVECTOR_TABLE", "rag_documents"),
             rag_top_k=_as_int("RAG_TOP_K", 8),
             rerank_top_n=_as_int("RERANK_TOP_N", 4),
