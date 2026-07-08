@@ -91,6 +91,16 @@ class KnowledgeBaseMember:
     created_at: datetime
 
 
+@dataclass(frozen=True)
+class KnowledgeBaseCapabilities:
+    current_user_role: str
+    can_read: bool
+    can_write: bool
+    can_manage_members: bool
+    can_manage_settings: bool
+    can_manage_api_keys: bool
+
+
 async def bootstrap_default_org(settings: AppSettings) -> EnterpriseUser:
     from core.auth import hash_password
 
@@ -524,6 +534,17 @@ async def require_knowledge_base_access(settings: AppSettings, kb_id: str, user:
         return _kb_to_dataclass(kb)
 
 
+async def get_knowledge_base_capabilities(settings: AppSettings, kb_id: str, user: Any) -> KnowledgeBaseCapabilities:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        kb = await session.get(KnowledgeBaseModel, UUID(kb_id))
+        if kb is None or kb.org_id != UUID(user.org_id) or kb.status == "deleted":
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=404, detail="Knowledge base not found")
+        return await _kb_capabilities(session, kb, user)
+
+
 async def add_audit_log(
     settings: AppSettings,
     *,
@@ -563,34 +584,53 @@ async def add_audit_log(
             session.add(row)
 
 
-async def list_audit_logs(settings: AppSettings, org_id: str, limit: int = 100) -> list[dict[str, Any]]:
+async def list_audit_logs(
+    settings: AppSettings,
+    org_id: str,
+    limit: int = 100,
+    knowledge_base_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
         result = await session.scalars(
             select(AuditLogModel)
             .where(AuditLogModel.org_id == UUID(org_id))
             .order_by(AuditLogModel.created_at.desc())
-            .limit(limit)
+            .limit(limit if knowledge_base_ids is None else min(max(limit * 5, limit), 1000))
         )
-        return [
-            {
-                "id": str(item.id),
-                "actor_user_id": str(item.actor_user_id) if item.actor_user_id else None,
-                "actor_department_id": str(item.actor_department_id) if item.actor_department_id else None,
-                "action": item.action,
-                "target_type": item.target_type,
-                "target_id": item.target_id,
-                "ip_address": item.ip_address,
-                "user_agent": item.user_agent,
-                "request_id": item.request_id,
-                "result": item.result,
-                "latency_ms": item.latency_ms,
-                "error_message": item.error_message,
-                "metadata": dict(item.metadata_ or {}),
-                "created_at": item.created_at.isoformat(),
-            }
-            for item in result
-        ]
+        allowed_ids = set(knowledge_base_ids or [])
+        items: list[dict[str, Any]] = []
+        for item in result:
+            metadata = dict(item.metadata_ or {})
+            if knowledge_base_ids is not None:
+                target_ids = {
+                    str(item.target_id or ""),
+                    str(metadata.get("knowledge_base_id") or ""),
+                    str(metadata.get("bound_knowledge_base_id") or ""),
+                }
+                if allowed_ids.isdisjoint(target_ids):
+                    continue
+            items.append(
+                {
+                    "id": str(item.id),
+                    "actor_user_id": str(item.actor_user_id) if item.actor_user_id else None,
+                    "actor_department_id": str(item.actor_department_id) if item.actor_department_id else None,
+                    "action": item.action,
+                    "target_type": item.target_type,
+                    "target_id": item.target_id,
+                    "ip_address": item.ip_address,
+                    "user_agent": item.user_agent,
+                    "request_id": item.request_id,
+                    "result": item.result,
+                    "latency_ms": item.latency_ms,
+                    "error_message": item.error_message,
+                    "metadata": metadata,
+                    "created_at": item.created_at.isoformat(),
+                }
+            )
+            if len(items) >= limit:
+                break
+        return items
 
 
 async def add_chat_log(
@@ -623,27 +663,69 @@ async def add_chat_log(
 
 
 async def _can_access_kb_model(session: Any, kb: KnowledgeBaseModel, user: Any, write: bool) -> bool:
+    capabilities = await _kb_capabilities(session, kb, user)
+    return capabilities.can_write if write else capabilities.can_read
+
+
+async def _kb_capabilities(session: Any, kb: KnowledgeBaseModel, user: Any) -> KnowledgeBaseCapabilities:
     if user.role == "admin":
-        return True
-    if str(kb.owner_user_id) == user.id:
-        return True
+        return KnowledgeBaseCapabilities(
+            current_user_role="admin",
+            can_read=True,
+            can_write=True,
+            can_manage_members=True,
+            can_manage_settings=True,
+            can_manage_api_keys=True,
+        )
+    is_owner = str(kb.owner_user_id) == user.id
     member = await session.scalar(
         select(KnowledgeBaseMemberModel).where(
             KnowledgeBaseMemberModel.knowledge_base_id == kb.id,
             KnowledgeBaseMemberModel.user_id == UUID(user.id),
         )
     )
+    member_role = member.role if member is not None else None
+    if is_owner or member_role == "owner":
+        return KnowledgeBaseCapabilities(
+            current_user_role="owner",
+            can_read=True,
+            can_write=True,
+            can_manage_members=True,
+            can_manage_settings=True,
+            can_manage_api_keys=True,
+        )
+    if member_role == "editor":
+        return KnowledgeBaseCapabilities(
+            current_user_role="editor",
+            can_read=True,
+            can_write=True,
+            can_manage_members=False,
+            can_manage_settings=False,
+            can_manage_api_keys=False,
+        )
+    if member_role == "viewer":
+        return KnowledgeBaseCapabilities(
+            current_user_role="viewer",
+            can_read=True,
+            can_write=False,
+            can_manage_members=False,
+            can_manage_settings=False,
+            can_manage_api_keys=False,
+        )
+    implicit_read = False
     if member is None:
-        if write:
-            return False
         if kb.visibility == "org":
-            return True
+            implicit_read = True
         if kb.visibility == "department" and user.department_id and user.department_id in list(kb.department_ids or []):
-            return True
-        return False
-    if write:
-        return member.role in {"owner", "editor"}
-    return member.role in {"owner", "editor", "viewer"}
+            implicit_read = True
+    return KnowledgeBaseCapabilities(
+        current_user_role="implicit_viewer" if implicit_read else "none",
+        can_read=implicit_read,
+        can_write=False,
+        can_manage_members=False,
+        can_manage_settings=False,
+        can_manage_api_keys=False,
+    )
 
 
 def _user_to_dataclass(model: UserModel) -> EnterpriseUser:

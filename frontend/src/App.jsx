@@ -176,16 +176,18 @@ function KnowledgeWorkspace({ api, user }) {
   const [urlForm] = Form.useForm();
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
   const departments = useQuery({ queryKey: ["departments"], queryFn: async () => (await api.get("/departments")).data.items || [] });
-  const users = useQuery({
-    queryKey: ["users"],
-    enabled: user?.role !== "member",
-    queryFn: async () => (await api.get("/users")).data.items || [],
-  });
   const activeKb = selectedKb || kbs.data?.[0]?.id || "";
   const activeKbRecord = (kbs.data || []).find((item) => item.id === activeKb);
+  const canWriteKb = Boolean(activeKbRecord?.can_write);
+  const canManageMembers = Boolean(activeKbRecord?.can_manage_members);
+  const memberCandidates = useQuery({
+    queryKey: ["kb-member-candidates", activeKb],
+    enabled: Boolean(activeKb && activeKbRecord?.can_manage_members),
+    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/member-candidates`)).data.items || [],
+  });
   const members = useQuery({
     queryKey: ["kb-members", activeKb],
-    enabled: Boolean(activeKb),
+    enabled: Boolean(activeKb && activeKbRecord?.can_manage_members),
     queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/members`)).data.items || [],
   });
   const files = useQuery({
@@ -425,8 +427,8 @@ function KnowledgeWorkspace({ api, user }) {
                   <span>{item.visibility} · {item.completed_file_count}/{item.file_count} 文件 · {item.failed_job_count} 失败</span>
                 </div>
                 <Space onClick={(event) => event.stopPropagation()}>
-                  <Button size="small" icon={<EditOutlined />} onClick={() => openEditKb(item)} />
-                  <Button size="small" danger icon={<DeleteOutlined />} onClick={() => confirmDeleteKb(item)} />
+              {item.can_manage_settings && <Button size="small" icon={<EditOutlined />} onClick={() => openEditKb(item)} />}
+              {item.can_manage_settings && <Button size="small" danger icon={<DeleteOutlined />} onClick={() => confirmDeleteKb(item)} />}
                 </Space>
               </Flex>
             </div>
@@ -447,6 +449,7 @@ function KnowledgeWorkspace({ api, user }) {
             <Tag color="green">已完成 {activeKbRecord.completed_file_count}</Tag>
             <Tag color={activeKbRecord.failed_job_count ? "red" : "default"}>失败任务 {activeKbRecord.failed_job_count}</Tag>
             <Tag>{activeKbRecord.visibility}</Tag>
+            <Tag color={activeKbRecord.can_write ? "blue" : "default"}>{activeKbRecord.current_user_role}</Tag>
           </div>
         )}
         {queueHealth.data && (
@@ -459,20 +462,20 @@ function KnowledgeWorkspace({ api, user }) {
             <div><strong className={queueHealth.data.worker_stale ? "danger-text" : ""}>{queueHealth.data.worker_stale ? "异常" : "在线"}</strong><span>Worker</span></div>
           </div>
         )}
-        <Upload.Dragger {...uploadProps} disabled={!activeKb} className="upload-zone">
+        <Upload.Dragger {...uploadProps} disabled={!activeKb || !canWriteKb} className="upload-zone">
           <p><CloudUploadOutlined /></p>
           <p>拖拽或点击上传文档</p>
         </Upload.Dragger>
         <Form form={urlForm} className="url-form stacked-form" layout="vertical" onFinish={(values) => ingestUrl.mutate(values)}>
           <Form.Item name="urls" rules={[{ required: true }]} className="grow">
-            <Input.TextArea rows={4} placeholder="每行一个 URL，先校验再确认入队" />
+            <Input.TextArea rows={4} disabled={!canWriteKb} placeholder="每行一个 URL，先校验再确认入队" />
           </Form.Item>
           <Space wrap>
             <Form.Item name="skip_duplicates" initialValue={true} valuePropName="checked" noStyle>
               <Switch checkedChildren="跳过重复" unCheckedChildren="允许重复" />
             </Form.Item>
-            <Button type="primary" htmlType="submit" loading={ingestUrl.isPending}>开始校验</Button>
-            <Button disabled={!urlPlan || !selectedUrlItemIds.length} loading={commitUrlPlan.isPending} onClick={() => commitUrlPlan.mutate()}>确认入队</Button>
+            <Button type="primary" htmlType="submit" disabled={!canWriteKb} loading={ingestUrl.isPending}>开始校验</Button>
+            <Button disabled={!canWriteKb || !urlPlan || !selectedUrlItemIds.length} loading={commitUrlPlan.isPending} onClick={() => commitUrlPlan.mutate()}>确认入队</Button>
           </Space>
         </Form>
         {urlPlan && (
@@ -509,8 +512,8 @@ function KnowledgeWorkspace({ api, user }) {
         <Flex justify="space-between" align="center" className="table-tools">
           <Typography.Title level={5}>文件</Typography.Title>
           <Space wrap>
-            <Button disabled={!selectedFileIds.length} icon={<ReloadOutlined />} onClick={() => batchReindexDocs.mutate(selectedFileIds)}>批量重建</Button>
-            <Button disabled={!selectedFileIds.length} danger icon={<DeleteOutlined />} onClick={() => batchDeleteDocs.mutate(selectedFileIds)}>批量删除</Button>
+            <Button disabled={!canWriteKb || !selectedFileIds.length} icon={<ReloadOutlined />} onClick={() => batchReindexDocs.mutate(selectedFileIds)}>批量重建</Button>
+            <Button disabled={!canWriteKb || !selectedFileIds.length} danger icon={<DeleteOutlined />} onClick={() => batchDeleteDocs.mutate(selectedFileIds)}>批量删除</Button>
             <Select
               value={fileStatus}
               onChange={setFileStatus}
@@ -530,7 +533,7 @@ function KnowledgeWorkspace({ api, user }) {
           size="middle"
           loading={files.isLoading}
           dataSource={files.data || []}
-          rowSelection={{ selectedRowKeys: selectedFileIds, onChange: setSelectedFileIds }}
+          rowSelection={canWriteKb ? { selectedRowKeys: selectedFileIds, onChange: setSelectedFileIds } : undefined}
           columns={[
             { title: "文件", dataIndex: "filename", render: (value, row) => <Space direction="vertical" size={0}><strong>{value}</strong><span className="muted">{row.content_type}</span></Space> },
             { title: "状态", dataIndex: "status", width: 120, render: (value) => <Tag color={value === "completed" ? "green" : value === "failed" ? "red" : "blue"}>{value}</Tag> },
@@ -543,8 +546,8 @@ function KnowledgeWorkspace({ api, user }) {
               render: (_, row) => (
                 <Space>
                   <Button icon={<EyeOutlined />} onClick={() => setPreview(row)}>预览</Button>
-                  <Button icon={<ReloadOutlined />} onClick={() => reindexDoc.mutate(row.id)}>重建</Button>
-                  <Button danger icon={<DeleteOutlined />} onClick={() => deleteDoc.mutate(row.id)} />
+                  {canWriteKb && <Button icon={<ReloadOutlined />} onClick={() => reindexDoc.mutate(row.id)}>重建</Button>}
+                  {canWriteKb && <Button danger icon={<DeleteOutlined />} onClick={() => deleteDoc.mutate(row.id)} />}
                 </Space>
               ),
             },
@@ -552,60 +555,64 @@ function KnowledgeWorkspace({ api, user }) {
         />
         <Typography.Title level={5}>入库任务</Typography.Title>
         <Space className="table-tools" wrap>
-          <Button disabled={!selectedJobIds.length} onClick={() => batchRetryJobs.mutate(selectedJobIds)}>批量重试失败</Button>
-          <Button disabled={!selectedJobIds.length} danger onClick={() => batchCancelJobs.mutate(selectedJobIds)}>批量取消</Button>
+          <Button disabled={!canWriteKb || !selectedJobIds.length} onClick={() => batchRetryJobs.mutate(selectedJobIds)}>批量重试失败</Button>
+          <Button disabled={!canWriteKb || !selectedJobIds.length} danger onClick={() => batchCancelJobs.mutate(selectedJobIds)}>批量取消</Button>
         </Space>
         <Tabs
           items={[
             {
               key: "active",
               label: `处理中 ${activeJobs.data?.length || 0}`,
-              children: <JobTable jobs={activeJobs.data || []} loading={activeJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} />,
+              children: <JobTable jobs={activeJobs.data || []} loading={activeJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} canWrite={canWriteKb} />,
             },
             {
               key: "history",
               label: <span><HistoryOutlined /> 历史 {historyJobs.data?.length || 0}</span>,
-              children: <JobTable jobs={historyJobs.data || []} loading={historyJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} />,
+              children: <JobTable jobs={historyJobs.data || []} loading={historyJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} canWrite={canWriteKb} />,
             },
           ]}
         />
-        <Typography.Title level={5}>成员权限</Typography.Title>
-        <Form form={memberForm} layout="inline" className="url-form" onFinish={(values) => upsertMember.mutate(values)}>
-          <Form.Item name="user_id" rules={[{ required: true }]} className="kb-select">
-            <Select
-              showSearch
-              placeholder="选择用户"
-              optionFilterProp="label"
-              options={(users.data || []).map((item) => ({ value: item.id, label: `${item.display_name} · ${item.email}` }))}
+        {canManageMembers && (
+          <>
+            <Typography.Title level={5}>成员权限</Typography.Title>
+            <Form form={memberForm} layout="inline" className="url-form" onFinish={(values) => upsertMember.mutate(values)}>
+              <Form.Item name="user_id" rules={[{ required: true }]} className="kb-select">
+                <Select
+                  showSearch
+                  placeholder="选择用户"
+                  optionFilterProp="label"
+                  options={(memberCandidates.data || []).map((item) => ({ value: item.id, label: `${item.display_name} · ${item.email}` }))}
+                />
+              </Form.Item>
+              <Form.Item name="role" rules={[{ required: true }]} initialValue="viewer">
+                <Select style={{ width: 140 }} options={[
+                  { value: "viewer", label: "viewer" },
+                  { value: "editor", label: "editor" },
+                  { value: "owner", label: "owner" },
+                ]} />
+              </Form.Item>
+              <Button type="primary" htmlType="submit" loading={upsertMember.isPending}>授权</Button>
+            </Form>
+            <Table
+              rowKey="user_id"
+              size="small"
+              loading={members.isLoading}
+              pagination={false}
+              dataSource={members.data || []}
+              columns={[
+                { title: "成员", render: (_, row) => <Space direction="vertical" size={0}><strong>{row.display_name}</strong><span className="muted">{row.email}</span></Space> },
+                { title: "角色", dataIndex: "role", width: 120, render: (value) => <Tag color={value === "owner" ? "purple" : value === "editor" ? "blue" : "default"}>{value}</Tag> },
+                { title: "部门", dataIndex: "department_id", width: 120, render: (value) => value?.slice(0, 8) || "-" },
+                { title: "加入时间", dataIndex: "created_at", width: 180, render: formatTime },
+                {
+                  title: "操作",
+                  width: 90,
+                  render: (_, row) => row.role === "owner" ? "-" : <Button size="small" danger onClick={() => removeMember.mutate(row.user_id)}>移除</Button>,
+                },
+              ]}
             />
-          </Form.Item>
-          <Form.Item name="role" rules={[{ required: true }]} initialValue="viewer">
-            <Select style={{ width: 140 }} options={[
-              { value: "viewer", label: "viewer" },
-              { value: "editor", label: "editor" },
-              { value: "owner", label: "owner" },
-            ]} />
-          </Form.Item>
-          <Button type="primary" htmlType="submit" loading={upsertMember.isPending}>授权</Button>
-        </Form>
-        <Table
-          rowKey="user_id"
-          size="small"
-          loading={members.isLoading}
-          pagination={false}
-          dataSource={members.data || []}
-          columns={[
-            { title: "成员", render: (_, row) => <Space direction="vertical" size={0}><strong>{row.display_name}</strong><span className="muted">{row.email}</span></Space> },
-            { title: "角色", dataIndex: "role", width: 120, render: (value) => <Tag color={value === "owner" ? "purple" : value === "editor" ? "blue" : "default"}>{value}</Tag> },
-            { title: "部门", dataIndex: "department_id", width: 120, render: (value) => value?.slice(0, 8) || "-" },
-            { title: "加入时间", dataIndex: "created_at", width: 180, render: formatTime },
-            {
-              title: "操作",
-              width: 90,
-              render: (_, row) => row.role === "owner" ? "-" : <Button size="small" danger onClick={() => removeMember.mutate(row.user_id)}>移除</Button>,
-            },
-          ]}
-        />
+          </>
+        )}
       </div>
       <DocumentPreview api={api} kbId={activeKb} file={preview} onClose={() => setPreview(null)} />
       <Modal
@@ -635,7 +642,7 @@ function KnowledgeWorkspace({ api, user }) {
   );
 }
 
-function JobTable({ jobs, loading, retryJob, cancelJob, selectedJobIds, setSelectedJobIds }) {
+function JobTable({ jobs, loading, retryJob, cancelJob, selectedJobIds, setSelectedJobIds, canWrite }) {
   return (
     <Table
       rowKey="id"
@@ -643,7 +650,7 @@ function JobTable({ jobs, loading, retryJob, cancelJob, selectedJobIds, setSelec
       loading={loading}
       pagination={{ pageSize: 6 }}
       dataSource={jobs}
-      rowSelection={{ selectedRowKeys: selectedJobIds, onChange: setSelectedJobIds }}
+      rowSelection={canWrite ? { selectedRowKeys: selectedJobIds, onChange: setSelectedJobIds } : undefined}
       columns={[
         { title: "来源", render: (_, row) => row.filename || row.source_uri },
         { title: "状态", dataIndex: "status", width: 120, render: (value) => <Tag color={value === "failed" ? "red" : value === "succeeded" ? "green" : "blue"}>{value}</Tag> },
@@ -656,8 +663,8 @@ function JobTable({ jobs, loading, retryJob, cancelJob, selectedJobIds, setSelec
           width: 150,
           render: (_, row) => (
             <Space>
-              {row.status === "failed" && <Button size="small" onClick={() => retryJob.mutate(row.id)}>重试</Button>}
-              {["pending", "running"].includes(row.status) && <Button size="small" danger onClick={() => cancelJob.mutate(row.id)}>取消</Button>}
+              {canWrite && row.status === "failed" && <Button size="small" onClick={() => retryJob.mutate(row.id)}>重试</Button>}
+              {canWrite && ["pending", "running"].includes(row.status) && <Button size="small" danger onClick={() => cancelJob.mutate(row.id)}>取消</Button>}
             </Space>
           ),
         },
@@ -1100,6 +1107,7 @@ function ApiKeyWorkspace({ api }) {
   const [form] = Form.useForm();
   const [secret, setSecret] = useState("");
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
+  const manageableKbs = (kbs.data || []).filter((item) => item.can_manage_api_keys);
   const keys = useQuery({ queryKey: ["apiKeys"], queryFn: async () => (await api.get("/api-keys")).data.items || [] });
   const createKey = useMutation({
     mutationFn: (values) => api.post("/api-keys", values),
@@ -1110,15 +1118,33 @@ function ApiKeyWorkspace({ api }) {
     },
     onError: (error) => message.error(readError(error)),
   });
+  const deleteKey = useMutation({
+    mutationFn: (id) => api.delete(`/api-keys/${id}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["apiKeys"] });
+      message.success("API Key 已禁用");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  function confirmDeleteKey(row) {
+    Modal.confirm({
+      title: `禁用 API Key「${row.name}」？`,
+      content: "禁用后使用该 Key 的三方项目将无法继续访问接口。",
+      okText: "禁用",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: () => deleteKey.mutate(row.id),
+    });
+  }
   return (
     <section className="surface full">
       <PageTitle title="开放接口" subtitle="为其他项目预留 OpenAI 兼容问答接口和独立检索接口，Key 绑定具体用户与知识库。" />
       <Form form={form} layout="inline" onFinish={(values) => createKey.mutate(values)}>
         <Form.Item name="name" rules={[{ required: true }]}><Input prefix={<KeyOutlined />} placeholder="Key 名称" /></Form.Item>
         <Form.Item name="knowledge_base_id" rules={[{ required: true }]} className="kb-select">
-          <Select placeholder="绑定知识库" options={(kbs.data || []).map((item) => ({ value: item.id, label: item.name }))} />
+          <Select placeholder="绑定知识库" options={manageableKbs.map((item) => ({ value: item.id, label: item.name }))} />
         </Form.Item>
-        <Button type="primary" htmlType="submit" loading={createKey.isPending}>创建 API Key</Button>
+        <Button type="primary" htmlType="submit" disabled={!manageableKbs.length} loading={createKey.isPending}>创建 API Key</Button>
       </Form>
       <Descriptions className="api-doc" bordered column={1} items={[
         { key: "chat", label: "OpenAI 兼容", children: "POST /v1/chat/completions，Header: Authorization: Bearer rag-..." },
@@ -1133,6 +1159,7 @@ function ApiKeyWorkspace({ api }) {
           { title: "知识库", dataIndex: "knowledge_base_id", render: (value) => kbs.data?.find((item) => item.id === value)?.name || value?.slice(0, 8) },
           { title: "最近使用", dataIndex: "last_used_at", render: formatTime },
           { title: "创建时间", dataIndex: "created_at", render: formatTime },
+          { title: "操作", width: 90, render: (_, row) => <Button size="small" danger icon={<DeleteOutlined />} onClick={() => confirmDeleteKey(row)} /> },
         ]}
       />
       <Modal title="API Key 只显示一次" open={Boolean(secret)} footer={<Button type="primary" onClick={() => setSecret("")}>我已保存</Button>} onCancel={() => setSecret("")}>

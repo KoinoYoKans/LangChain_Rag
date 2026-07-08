@@ -20,7 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from config.model import build_chat_model
 from config.settings import AppSettings
 from core.auth import CurrentUser, create_access_token, require_current_user
-from core.api_key_store import ApiKey, create_api_key, list_api_keys, verify_api_key
+from core.api_key_store import ApiKey, create_api_key, get_api_key, list_api_keys, revoke_api_key, revoke_api_keys_for_kb_user, verify_api_key
 from core.conversation_store import (
     Conversation,
     add_message,
@@ -52,8 +52,8 @@ from core.enterprise_store import (
     create_user,
     deactivate_user,
     get_user_by_id,
+    get_knowledge_base_capabilities,
     get_knowledge_base_stats,
-    is_knowledge_base_owner,
     list_knowledge_base_members,
     list_audit_logs,
     list_departments,
@@ -345,6 +345,12 @@ class KnowledgeBaseResponse(BaseModel):
     file_count: int = 0
     completed_file_count: int = 0
     failed_job_count: int = 0
+    current_user_role: str = "none"
+    can_read: bool = False
+    can_write: bool = False
+    can_manage_members: bool = False
+    can_manage_settings: bool = False
+    can_manage_api_keys: bool = False
     created_at: str
     updated_at: str
 
@@ -840,10 +846,15 @@ def create_app() -> FastAPI:
     @app.get("/knowledge-bases", response_model=KnowledgeBaseListResponse)
     async def knowledge_bases(current_user: CurrentUser = Depends(require_current_user)) -> KnowledgeBaseListResponse:
         settings = get_state(app).settings
+        knowledge_bases = await list_knowledge_bases(settings, current_user)
         return KnowledgeBaseListResponse(
             items=[
-                kb_response(item, await get_knowledge_base_stats(settings, item.id))
-                for item in await list_knowledge_bases(settings, current_user)
+                kb_response(
+                    item,
+                    await get_knowledge_base_stats(settings, item.id),
+                    await get_knowledge_base_capabilities(settings, item.id, current_user),
+                )
+                for item in knowledge_bases
             ]
         )
 
@@ -874,7 +885,11 @@ def create_app() -> FastAPI:
             metadata={"name": kb.name, "visibility": kb.visibility, "department_ids": kb.department_ids},
             **audit_context(http_request),
         )
-        return kb_response(kb, await get_knowledge_base_stats(settings, kb.id))
+        return kb_response(
+            kb,
+            await get_knowledge_base_stats(settings, kb.id),
+            await get_knowledge_base_capabilities(settings, kb.id, current_user),
+        )
 
     @app.patch("/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseResponse)
     async def update_knowledge_base_endpoint(
@@ -883,8 +898,8 @@ def create_app() -> FastAPI:
         request: KnowledgeBaseUpdateRequest,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseResponse:
-        require_manager(current_user)
         settings = get_state(app).settings
+        await require_kb_settings_admin(settings, knowledge_base_id, current_user)
         kb = await update_knowledge_base(
             settings,
             kb_id=knowledge_base_id,
@@ -905,7 +920,11 @@ def create_app() -> FastAPI:
             metadata={"name": kb.name, "visibility": kb.visibility, "department_ids": kb.department_ids},
             **audit_context(http_request),
         )
-        return kb_response(kb, await get_knowledge_base_stats(settings, kb.id))
+        return kb_response(
+            kb,
+            await get_knowledge_base_stats(settings, kb.id),
+            await get_knowledge_base_capabilities(settings, kb.id, current_user),
+        )
 
     @app.delete("/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseResponse)
     async def delete_knowledge_base_endpoint(
@@ -913,8 +932,8 @@ def create_app() -> FastAPI:
         knowledge_base_id: str,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseResponse:
-        require_manager(current_user)
         settings = get_state(app).settings
+        await require_kb_settings_admin(settings, knowledge_base_id, current_user)
         kb = await soft_delete_knowledge_base(settings, kb_id=knowledge_base_id, user=current_user)
         await add_audit_log(
             settings,
@@ -958,6 +977,15 @@ def create_app() -> FastAPI:
             ]
         )
 
+    @app.get("/knowledge-bases/{knowledge_base_id}/member-candidates")
+    async def knowledge_base_member_candidates_endpoint(
+        knowledge_base_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, list[UserResponse]]:
+        settings = get_state(app).settings
+        await require_kb_member_admin(settings, knowledge_base_id, current_user)
+        return {"items": [user_response(item) for item in await list_users(settings, current_user.org_id) if item.is_active]}
+
     @app.put("/knowledge-bases/{knowledge_base_id}/members", response_model=KnowledgeBaseMemberResponse)
     async def upsert_knowledge_base_member_endpoint(
         http_request: Request,
@@ -974,6 +1002,9 @@ def create_app() -> FastAPI:
             user_id=request.user_id,
             role=request.role,
         )
+        revoked_key_count = 0
+        if request.role != "owner":
+            revoked_key_count = await revoke_api_keys_for_kb_user(settings, kb_id=knowledge_base_id, user_id=request.user_id)
         await add_audit_log(
             settings,
             org_id=current_user.org_id,
@@ -982,7 +1013,7 @@ def create_app() -> FastAPI:
             action="knowledge_base.member_upsert",
             target_type="knowledge_base",
             target_id=knowledge_base_id,
-            metadata={"user_id": request.user_id, "role": request.role},
+            metadata={"user_id": request.user_id, "role": request.role, "revoked_api_key_count": revoked_key_count},
             **audit_context(http_request),
         )
         return kb_member_response(member)
@@ -997,6 +1028,7 @@ def create_app() -> FastAPI:
         settings = get_state(app).settings
         await require_knowledge_base_access(settings, knowledge_base_id, current_user, write=True)
         await require_kb_member_admin(settings, knowledge_base_id, current_user)
+        revoked_key_count = await revoke_api_keys_for_kb_user(settings, kb_id=knowledge_base_id, user_id=member_user_id)
         await remove_knowledge_base_member(settings, kb_id=knowledge_base_id, user_id=member_user_id)
         await add_audit_log(
             settings,
@@ -1006,7 +1038,7 @@ def create_app() -> FastAPI:
             action="knowledge_base.member_remove",
             target_type="knowledge_base",
             target_id=knowledge_base_id,
-            metadata={"user_id": member_user_id},
+            metadata={"user_id": member_user_id, "revoked_api_key_count": revoked_key_count},
             **audit_context(http_request),
         )
         return {"status": "ok"}
@@ -1018,13 +1050,32 @@ def create_app() -> FastAPI:
     ) -> AuditLogListResponse:
         require_manager(current_user)
         settings = get_state(app).settings
-        return AuditLogListResponse(items=await list_audit_logs(settings, current_user.org_id, limit=limit))
+        knowledge_base_ids = None
+        if not current_user.is_admin:
+            knowledge_base_ids = [item.id for item in await list_knowledge_bases(settings, current_user)]
+        return AuditLogListResponse(
+            items=await list_audit_logs(
+                settings,
+                current_user.org_id,
+                limit=limit,
+                knowledge_base_ids=knowledge_base_ids,
+            )
+        )
 
     @app.get("/api-keys", response_model=ApiKeyListResponse)
     async def api_keys(current_user: CurrentUser = Depends(require_current_user)) -> ApiKeyListResponse:
-        require_manager(current_user)
         settings = get_state(app).settings
-        return ApiKeyListResponse(items=[api_key_response(item) for item in await list_api_keys(settings, current_user.org_id)])
+        manageable_kb_ids = [
+            kb.id
+            for kb in await list_knowledge_bases(settings, current_user)
+            if (await get_knowledge_base_capabilities(settings, kb.id, current_user)).can_manage_api_keys
+        ]
+        return ApiKeyListResponse(
+            items=[
+                api_key_response(item)
+                for item in await list_api_keys(settings, current_user.org_id, knowledge_base_ids=manageable_kb_ids)
+            ]
+        )
 
     @app.post("/api-keys", response_model=ApiKeyCreateResponse)
     async def create_api_key_endpoint(
@@ -1032,9 +1083,8 @@ def create_app() -> FastAPI:
         request: ApiKeyCreateRequest,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> ApiKeyCreateResponse:
-        require_manager(current_user)
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, request.knowledge_base_id, current_user, write=True)
+        await require_kb_api_key_admin(state.settings, request.knowledge_base_id, current_user)
         created = await create_api_key(
             state.settings,
             org_id=current_user.org_id,
@@ -1055,11 +1105,39 @@ def create_app() -> FastAPI:
         )
         return ApiKeyCreateResponse(**api_key_response(created.record).model_dump(), secret=created.secret)
 
+    @app.delete("/api-keys/{api_key_id}", response_model=ApiKeyResponse)
+    async def delete_api_key_endpoint(
+        http_request: Request,
+        api_key_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> ApiKeyResponse:
+        state = get_state(app)
+        existing = await get_api_key(state.settings, current_user.org_id, api_key_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="API key not found")
+        await require_kb_api_key_admin(state.settings, existing.knowledge_base_id, current_user)
+        revoked = await revoke_api_key(state.settings, current_user.org_id, api_key_id)
+        if revoked is None:
+            raise HTTPException(status_code=404, detail="API key not found")
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="api_key.revoke",
+            target_type="api_key",
+            target_id=revoked.id,
+            metadata={"name": revoked.name, "knowledge_base_id": revoked.knowledge_base_id},
+            **audit_context(http_request),
+        )
+        return api_key_response(revoked)
+
     @app.post("/documents", response_model=DocumentUploadResponse)
     async def upload_document(
         user_id: str = Form(..., min_length=1),
         file: UploadFile = File(...),
     ) -> DocumentUploadResponse:
+        raise HTTPException(status_code=410, detail="Use /knowledge-bases/{knowledge_base_id}/documents with bearer authentication")
         state = require_ready(app)
         filename = file.filename or "uploaded"
         if not any(filename.lower().endswith(extension) for extension in SUPPORTED_EXTENSIONS):
@@ -1722,6 +1800,7 @@ def create_app() -> FastAPI:
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> FileListResponse:
+        raise HTTPException(status_code=410, detail="Use /knowledge-bases/{knowledge_base_id}/documents with bearer authentication")
         state = require_ready(app)
         return FileListResponse(
             items=[
@@ -1732,6 +1811,7 @@ def create_app() -> FastAPI:
 
     @app.get("/documents/{file_id}", response_model=FileRecordResponse)
     async def document_detail(file_id: str, user_id: str = Query(..., min_length=1)) -> FileRecordResponse:
+        raise HTTPException(status_code=410, detail="Use /knowledge-bases/{knowledge_base_id}/documents/{file_id}/preview with bearer authentication")
         state = require_ready(app)
         item = await get_file(state.settings, user_id, file_id)
         if item is None:
@@ -1740,6 +1820,7 @@ def create_app() -> FastAPI:
 
     @app.delete("/documents/{file_id}", response_model=DeleteDocumentResponse)
     async def delete_document(file_id: str, user_id: str = Query(..., min_length=1)) -> DeleteDocumentResponse:
+        raise HTTPException(status_code=410, detail="Use /knowledge-bases/{knowledge_base_id}/documents/{file_id} with bearer authentication")
         state = require_ready(app)
         item = await get_file(state.settings, user_id, file_id)
         if item is None:
@@ -2166,30 +2247,73 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/knowledge/{knowledge_base_id}/retrieval", response_model=RetrievalResponse)
     async def open_retrieval(
+        http_request: Request,
         knowledge_base_id: str,
         request: RetrievalRequest,
         authorization: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     ) -> RetrievalResponse:
         state = require_ready(app)
+        started_at = time.perf_counter()
         api_key = await require_valid_api_key(state.settings, authorization, x_api_key)
         if api_key.knowledge_base_id != knowledge_base_id:
+            await add_audit_log(
+                state.settings,
+                org_id=api_key.org_id,
+                actor_user_id=api_key.user_id,
+                action="openapi.retrieval",
+                target_type="knowledge_base",
+                target_id=knowledge_base_id,
+                metadata={"api_key_id": api_key.id, "key_prefix": api_key.key_prefix, "bound_knowledge_base_id": api_key.knowledge_base_id},
+                result="failed",
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                error_message="API key is not bound to this knowledge base",
+                **audit_context(http_request),
+            )
             raise HTTPException(status_code=403, detail="API key is not bound to this knowledge base")
-        retrieval = await hybrid_search(
+        try:
+            retrieval = await hybrid_search(
+                state.settings,
+                state.vector_store,
+                request.query,
+                top_k=request.top_k,
+                user_id=api_key.user_id,
+                knowledge_base_id=knowledge_base_id,
+            )
+            ranked = rerank_or_original(
+                state.reranker,
+                request.query,
+                retrieval.documents,
+                min(request.top_k, state.settings.rerank_top_n or request.top_k),
+            )
+            sources = [source_from_document(item.document, item.score) for item in ranked]
+        except Exception as exc:  # noqa: BLE001
+            await add_audit_log(
+                state.settings,
+                org_id=api_key.org_id,
+                actor_user_id=api_key.user_id,
+                action="openapi.retrieval",
+                target_type="knowledge_base",
+                target_id=knowledge_base_id,
+                metadata={"api_key_id": api_key.id, "key_prefix": api_key.key_prefix, "top_k": request.top_k},
+                result="failed",
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                error_message=str(exc)[:1000],
+                **audit_context(http_request),
+            )
+            raise
+        await add_audit_log(
             state.settings,
-            state.vector_store,
-            request.query,
-            top_k=request.top_k,
-            user_id=api_key.user_id,
-            knowledge_base_id=knowledge_base_id,
+            org_id=api_key.org_id,
+            actor_user_id=api_key.user_id,
+            action="openapi.retrieval",
+            target_type="knowledge_base",
+            target_id=knowledge_base_id,
+            metadata={"api_key_id": api_key.id, "key_prefix": api_key.key_prefix, "top_k": request.top_k, "source_count": len(sources)},
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+            **audit_context(http_request),
         )
-        ranked = rerank_or_original(
-            state.reranker,
-            request.query,
-            retrieval.documents,
-            min(request.top_k, state.settings.rerank_top_n or request.top_k),
-        )
-        return RetrievalResponse(items=[source_from_document(item.document, item.score) for item in ranked])
+        return RetrievalResponse(items=sources)
 
     @app.post("/v1/chat/completions")
     async def openai_chat_completions(
@@ -2528,7 +2652,7 @@ def department_response(department: Any) -> DepartmentResponse:
     )
 
 
-def kb_response(kb: Any, stats: Any | None = None) -> KnowledgeBaseResponse:
+def kb_response(kb: Any, stats: Any | None = None, capabilities: Any | None = None) -> KnowledgeBaseResponse:
     return KnowledgeBaseResponse(
         id=kb.id,
         org_id=kb.org_id,
@@ -2541,6 +2665,12 @@ def kb_response(kb: Any, stats: Any | None = None) -> KnowledgeBaseResponse:
         file_count=int(getattr(stats, "file_count", 0) if stats else 0),
         completed_file_count=int(getattr(stats, "completed_file_count", 0) if stats else 0),
         failed_job_count=int(getattr(stats, "failed_job_count", 0) if stats else 0),
+        current_user_role=getattr(capabilities, "current_user_role", "none"),
+        can_read=bool(getattr(capabilities, "can_read", False)),
+        can_write=bool(getattr(capabilities, "can_write", False)),
+        can_manage_members=bool(getattr(capabilities, "can_manage_members", False)),
+        can_manage_settings=bool(getattr(capabilities, "can_manage_settings", False)),
+        can_manage_api_keys=bool(getattr(capabilities, "can_manage_api_keys", False)),
         created_at=kb.created_at.isoformat(),
         updated_at=kb.updated_at.isoformat(),
     )
@@ -2663,9 +2793,24 @@ async def require_valid_api_key(
 
 
 async def require_kb_member_admin(settings: AppSettings, kb_id: str, user: CurrentUser) -> None:
-    if user.is_manager or await is_knowledge_base_owner(settings, kb_id=kb_id, user_id=user.id):
+    capabilities = await get_knowledge_base_capabilities(settings, kb_id, user)
+    if capabilities.can_manage_members:
         return
-    raise HTTPException(status_code=403, detail="Knowledge base owner or manager role required")
+    raise HTTPException(status_code=403, detail="Knowledge base owner or admin role required")
+
+
+async def require_kb_settings_admin(settings: AppSettings, kb_id: str, user: CurrentUser) -> None:
+    capabilities = await get_knowledge_base_capabilities(settings, kb_id, user)
+    if capabilities.can_manage_settings:
+        return
+    raise HTTPException(status_code=403, detail="Knowledge base owner or admin role required")
+
+
+async def require_kb_api_key_admin(settings: AppSettings, kb_id: str, user: CurrentUser) -> None:
+    capabilities = await get_knowledge_base_capabilities(settings, kb_id, user)
+    if capabilities.can_manage_api_keys:
+        return
+    raise HTTPException(status_code=403, detail="Knowledge base API key management denied")
 
 
 def build_reindex_payload(settings: AppSettings, item: RagFile) -> tuple[dict[str, Any], str | None]:
