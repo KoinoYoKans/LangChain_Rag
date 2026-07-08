@@ -63,6 +63,7 @@ from core.enterprise_store import (
     update_user,
     upsert_knowledge_base_member,
 )
+from core.feedback_store import Feedback, create_feedback, list_feedback
 from core.file_store import (
     RagFile,
     create_processing_file,
@@ -127,6 +128,39 @@ class ChatResponse(BaseModel):
     assistant_message_id: str
     answer: str
     sources: list[Source]
+    confidence: str
+    confidence_score: float | None = None
+
+
+class FeedbackRequest(BaseModel):
+    knowledge_base_id: str = Field(min_length=1)
+    conversation_id: str = Field(min_length=1)
+    assistant_message_id: str = Field(min_length=1)
+    rating: str = Field(pattern="^(up|down)$")
+    question: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+    reason: str | None = Field(default=None, max_length=120)
+    comment: str | None = Field(default=None, max_length=1000)
+    sources_snapshot: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class FeedbackResponse(BaseModel):
+    id: str
+    knowledge_base_id: str
+    user_id: str
+    conversation_id: str
+    assistant_message_id: str
+    rating: str
+    reason: str | None
+    comment: str | None
+    question: str
+    answer: str
+    sources_snapshot: list[dict[str, Any]]
+    created_at: str
+
+
+class FeedbackListResponse(BaseModel):
+    items: list[FeedbackResponse]
 
 
 class DocumentUploadResponse(BaseModel):
@@ -1540,6 +1574,7 @@ def create_app() -> FastAPI:
                 source_from_document(item.document, rerank_score=item.score)
                 for item in selected
             ]
+            confidence, confidence_score = answer_confidence(sources)
             assistant_message = await add_message(
                 state.settings,
                 message_id=str(uuid4()),
@@ -1549,7 +1584,11 @@ def create_app() -> FastAPI:
                 user_id=current_user.id,
                 role="assistant",
                 content=str(answer),
-                metadata={"sources": [source.model_dump() for source in sources]},
+                metadata={
+                    "sources": [source.model_dump() for source in sources],
+                    "confidence": confidence,
+                    "confidence_score": confidence_score,
+                },
             )
             await add_chat_log(
                 state.settings,
@@ -1621,6 +1660,104 @@ def create_app() -> FastAPI:
             assistant_message_id=assistant_message.id,
             answer=str(answer),
             sources=sources,
+            confidence=confidence,
+            confidence_score=confidence_score,
+        )
+
+    @app.post("/feedback", response_model=FeedbackResponse)
+    async def create_feedback_endpoint(
+        http_request: Request,
+        request: FeedbackRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> FeedbackResponse:
+        state = require_ready(app)
+        await require_knowledge_base_access(state.settings, request.knowledge_base_id, current_user)
+        try:
+            UUID(request.conversation_id)
+            UUID(request.assistant_message_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid conversation_id or assistant_message_id") from exc
+        conversation = await get_conversation(
+            state.settings,
+            conversation_id=request.conversation_id,
+            user_id=current_user.id,
+            knowledge_base_id=request.knowledge_base_id,
+        )
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        messages = await list_conversation_messages(
+            state.settings,
+            conversation_id=request.conversation_id,
+            user_id=current_user.id,
+            knowledge_base_id=request.knowledge_base_id,
+            limit=500,
+        )
+        assistant_index = next(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.id == request.assistant_message_id and message.role == "assistant"
+            ),
+            None,
+        )
+        if assistant_index is None:
+            raise HTTPException(status_code=404, detail="Assistant message not found")
+        assistant_message = messages[assistant_index]
+        previous_user_message = next(
+            (message for message in reversed(messages[:assistant_index]) if message.role == "user"),
+            None,
+        )
+        feedback = await create_feedback(
+            state.settings,
+            org_id=current_user.org_id,
+            knowledge_base_id=request.knowledge_base_id,
+            user_id=current_user.id,
+            conversation_id=request.conversation_id,
+            assistant_message_id=request.assistant_message_id,
+            rating=request.rating,
+            reason=request.reason,
+            comment=request.comment,
+            question=previous_user_message.content if previous_user_message else request.question,
+            answer=assistant_message.content,
+            sources_snapshot=assistant_message.metadata.get("sources", request.sources_snapshot),
+        )
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="feedback.create",
+            target_type="assistant_message",
+            target_id=request.assistant_message_id,
+            metadata={"knowledge_base_id": request.knowledge_base_id, "rating": request.rating, "reason": request.reason},
+            **audit_context(http_request),
+        )
+        return feedback_response(feedback)
+
+    @app.get("/feedback", response_model=FeedbackListResponse)
+    async def feedback_items(
+        knowledge_base_id: str | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> FeedbackListResponse:
+        state = require_ready(app)
+        require_manager(current_user)
+        if knowledge_base_id:
+            await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
+        elif not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="Managers must filter feedback by knowledge_base_id")
+        return FeedbackListResponse(
+            items=[
+                feedback_response(item)
+                for item in await list_feedback(
+                    state.settings,
+                    org_id=current_user.org_id,
+                    knowledge_base_id=knowledge_base_id,
+                    limit=limit,
+                    offset=offset,
+                )
+            ]
         )
 
     @app.post("/v1/knowledge/{knowledge_base_id}/retrieval", response_model=RetrievalResponse)
@@ -1707,6 +1844,7 @@ def create_app() -> FastAPI:
         else:
             answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
         sources = [source_from_document(item.document, item.score).model_dump() for item in selected]
+        confidence, confidence_score = answer_confidence([Source(**source) for source in sources])
         conversation_id = request.conversation_id or str(uuid4())
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         await add_chat_log(
@@ -1751,6 +1889,8 @@ def create_app() -> FastAPI:
                 "total_tokens": prompt_tokens + completion_tokens,
             },
             "sources": sources,
+            "confidence": confidence,
+            "confidence_score": confidence_score,
             "conversation_id": conversation_id,
         }
 
@@ -1883,6 +2023,42 @@ def source_from_document(document: Document, rerank_score: float | None) -> Sour
         page_number=metadata.get("page_number"),
         bbox={key: float(value) for key, value in bbox.items()} if isinstance(bbox, dict) else None,
         snippet=snippet,
+    )
+
+
+def answer_confidence(sources: list[Source]) -> tuple[str, float | None]:
+    scores = [
+        score
+        for source in sources
+        for score in (source.rerank_score, source.hybrid_score, source.vector_score, source.bm25_score)
+        if score is not None
+    ]
+    if not sources:
+        return "low", None
+    if not scores:
+        return "medium", None
+    best_score = max(scores)
+    if best_score >= 0.7 and len(sources) >= 2:
+        return "high", best_score
+    if best_score >= 0.35:
+        return "medium", best_score
+    return "low", best_score
+
+
+def feedback_response(feedback: Feedback) -> FeedbackResponse:
+    return FeedbackResponse(
+        id=feedback.id,
+        knowledge_base_id=feedback.knowledge_base_id,
+        user_id=feedback.user_id,
+        conversation_id=feedback.conversation_id,
+        assistant_message_id=feedback.assistant_message_id,
+        rating=feedback.rating,
+        reason=feedback.reason,
+        comment=feedback.comment,
+        question=feedback.question,
+        answer=feedback.answer,
+        sources_snapshot=feedback.sources_snapshot,
+        created_at=feedback.created_at.isoformat(),
     )
 
 

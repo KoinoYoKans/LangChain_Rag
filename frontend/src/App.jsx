@@ -6,11 +6,13 @@ import {
   BankOutlined,
   CloudUploadOutlined,
   DeleteOutlined,
+  DislikeOutlined,
   EditOutlined,
   EyeOutlined,
   FileSearchOutlined,
   HistoryOutlined,
   KeyOutlined,
+  LikeOutlined,
   MessageOutlined,
   ReloadOutlined,
   TeamOutlined,
@@ -627,6 +629,11 @@ function ChatWorkspace({ api }) {
     },
     onError: (error) => message.error(readError(error)),
   });
+  const feedbackMutation = useMutation({
+    mutationFn: (payload) => api.post("/feedback", payload),
+    onSuccess: () => message.success("反馈已记录"),
+    onError: (error) => message.error(readError(error)),
+  });
 
   async function openConversation(item) {
     try {
@@ -677,6 +684,46 @@ function ChatWorkspace({ api }) {
     });
   }
 
+  function submitFeedback(item, rating, extra = {}) {
+    feedbackMutation.mutate({
+      knowledge_base_id: kbId,
+      conversation_id: item.conversation_id || conversationId,
+      assistant_message_id: item.assistant_message_id,
+      rating,
+      question: item.question,
+      answer: item.answer,
+      reason: extra.reason,
+      comment: extra.comment,
+      sources_snapshot: item.sources || [],
+    });
+  }
+
+  function dislikeAnswer(item) {
+    let reason = "answer_wrong";
+    let comment = "";
+    Modal.confirm({
+      title: "反馈问题",
+      content: (
+        <Space direction="vertical" className="full-select">
+          <Select
+            defaultValue={reason}
+            options={[
+              { value: "answer_wrong", label: "答案不正确" },
+              { value: "source_missing", label: "缺少引用" },
+              { value: "source_mismatch", label: "引用不匹配" },
+              { value: "unclear", label: "表达不清楚" },
+            ]}
+            onChange={(value) => { reason = value; }}
+          />
+          <Input.TextArea rows={3} placeholder="补充说明" onChange={(event) => { comment = event.target.value; }} />
+        </Space>
+      ),
+      okText: "提交",
+      cancelText: "取消",
+      onOk: () => submitFeedback(item, "down", { reason, comment }),
+    });
+  }
+
   return (
     <section className="page-grid chat-grid">
       <div className="surface narrow">
@@ -716,7 +763,18 @@ function ChatWorkspace({ api }) {
         <div className="answer-list">
           {messages.map((item) => (
             <article className="answer-item" key={item.assistant_message_id || item.user_message_id}>
-              <Typography.Title level={5}>{item.question}</Typography.Title>
+              <Flex justify="space-between" gap={12} align="start">
+                <Typography.Title level={5}>{item.question}</Typography.Title>
+                <Space>
+                  <Tag color={confidenceColor(item.confidence)}>{confidenceText(item.confidence, item.confidence_score)}</Tag>
+                  {item.assistant_message_id && (
+                    <>
+                      <Button size="small" icon={<LikeOutlined />} onClick={() => submitFeedback(item, "up")} />
+                      <Button size="small" icon={<DislikeOutlined />} onClick={() => dislikeAnswer(item)} />
+                    </>
+                  )}
+                </Space>
+              </Flex>
               <Typography.Paragraph>{item.answer}</Typography.Paragraph>
               <Table
                 rowKey={(row, index) => `${row.chunk_id}-${index}`}
@@ -948,23 +1006,55 @@ function ApiKeyWorkspace({ api }) {
 
 function AuditWorkspace({ api }) {
   const logs = useQuery({ queryKey: ["audit"], refetchInterval: 5000, queryFn: async () => (await api.get("/audit-logs")).data.items || [] });
+  const feedback = useQuery({ queryKey: ["feedback"], refetchInterval: 10000, queryFn: async () => (await api.get("/feedback")).data.items || [] });
   return (
     <section className="surface full">
-      <PageTitle title="审计日志" subtitle="记录用户、部门、IP、请求 ID、操作对象、结果和耗时。" />
-      <Table
-        rowKey="id"
-        loading={logs.isLoading}
-        dataSource={logs.data || []}
-        expandable={{ expandedRowRender: (row) => <pre className="json-block">{JSON.stringify(row, null, 2)}</pre> }}
-        columns={[
-          { title: "操作", dataIndex: "action" },
-          { title: "结果", dataIndex: "result", width: 100, render: (value) => <Tag color={value === "success" ? "green" : "red"}>{value}</Tag> },
-          { title: "用户", dataIndex: "actor_user_id", render: (value) => value?.slice(0, 8) || "-" },
-          { title: "部门", dataIndex: "actor_department_id", render: (value) => value?.slice(0, 8) || "-" },
-          { title: "IP", dataIndex: "ip_address" },
-          { title: "对象", render: (_, row) => `${row.target_type || "-"} / ${row.target_id || "-"}` },
-          { title: "耗时", dataIndex: "latency_ms", render: (value) => value == null ? "-" : `${value}ms` },
-          { title: "时间", dataIndex: "created_at", render: formatTime },
+      <PageTitle title="审计与反馈" subtitle="记录用户操作、请求上下文和回答质量反馈。" />
+      <Tabs
+        items={[
+          {
+            key: "audit",
+            label: "审计日志",
+            children: (
+              <Table
+                rowKey="id"
+                loading={logs.isLoading}
+                dataSource={logs.data || []}
+                expandable={{ expandedRowRender: (row) => <pre className="json-block">{JSON.stringify(row, null, 2)}</pre> }}
+                columns={[
+                  { title: "操作", dataIndex: "action" },
+                  { title: "结果", dataIndex: "result", width: 100, render: (value) => <Tag color={value === "success" ? "green" : "red"}>{value}</Tag> },
+                  { title: "用户", dataIndex: "actor_user_id", render: (value) => value?.slice(0, 8) || "-" },
+                  { title: "部门", dataIndex: "actor_department_id", render: (value) => value?.slice(0, 8) || "-" },
+                  { title: "IP", dataIndex: "ip_address" },
+                  { title: "对象", render: (_, row) => `${row.target_type || "-"} / ${row.target_id || "-"}` },
+                  { title: "耗时", dataIndex: "latency_ms", render: (value) => value == null ? "-" : `${value}ms` },
+                  { title: "时间", dataIndex: "created_at", render: formatTime },
+                ]}
+              />
+            ),
+          },
+          {
+            key: "feedback",
+            label: "回答反馈",
+            children: (
+              <Table
+                rowKey="id"
+                loading={feedback.isLoading}
+                dataSource={feedback.data || []}
+                expandable={{ expandedRowRender: (row) => <pre className="json-block">{JSON.stringify(row, null, 2)}</pre> }}
+                columns={[
+                  { title: "评价", dataIndex: "rating", width: 90, render: (value) => <Tag color={value === "up" ? "green" : "red"}>{value === "up" ? "赞" : "踩"}</Tag> },
+                  { title: "原因", dataIndex: "reason", render: (value) => value || "-" },
+                  { title: "问题", dataIndex: "question", ellipsis: true },
+                  { title: "回答", dataIndex: "answer", ellipsis: true },
+                  { title: "用户", dataIndex: "user_id", render: (value) => value?.slice(0, 8) || "-" },
+                  { title: "知识库", dataIndex: "knowledge_base_id", render: (value) => value?.slice(0, 8) || "-" },
+                  { title: "时间", dataIndex: "created_at", render: formatTime },
+                ]}
+              />
+            ),
+          },
         ]}
       />
     </section>
@@ -1014,6 +1104,8 @@ function buildChatRecordsFromMessages(items) {
         question: pendingQuestion?.content || "历史问题",
         answer: item.content,
         sources: item.metadata?.sources || [],
+        confidence: item.metadata?.confidence || "medium",
+        confidence_score: item.metadata?.confidence_score,
       });
       pendingQuestion = null;
     }
@@ -1026,6 +1118,8 @@ function buildChatRecordsFromMessages(items) {
       question: pendingQuestion.content,
       answer: "该问题尚未生成回答，可能是上次问答中断或失败。",
       sources: [],
+      confidence: "low",
+      confidence_score: null,
     });
   }
   return records;
@@ -1046,6 +1140,18 @@ function formatTime(value) {
 function scoreText(value) {
   if (value == null) return "-";
   return Number(value).toFixed(3);
+}
+
+function confidenceText(value, score) {
+  const labels = { high: "高可信", medium: "中可信", low: "低可信" };
+  const suffix = score == null ? "" : ` ${Number(score).toFixed(2)}`;
+  return `${labels[value] || "中可信"}${suffix}`;
+}
+
+function confidenceColor(value) {
+  if (value === "high") return "green";
+  if (value === "low") return "orange";
+  return "blue";
 }
 
 createRoot(document.getElementById("root")).render(<App />);

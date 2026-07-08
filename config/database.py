@@ -176,6 +176,30 @@ class ChatLogModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class FeedbackModel(Base):
+    __tablename__ = os.getenv("FEEDBACK_TABLE", "rag_feedback")
+    __table_args__ = (
+        CheckConstraint("rating in ('up', 'down')", name="rag_feedback_rating_check"),
+        Index("rag_feedback_org_created_idx", "org_id", "created_at"),
+        Index("rag_feedback_kb_created_idx", "knowledge_base_id", "created_at"),
+        Index("rag_feedback_message_idx", "assistant_message_id"),
+    )
+
+    id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    org_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_base_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    conversation_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    assistant_message_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    rating: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    comment: Mapped[str | None] = mapped_column(Text)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    sources_snapshot: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class RagFileModel(Base):
     __tablename__ = os.getenv("RAG_FILE_TABLE", "rag_files")
     __table_args__ = (
