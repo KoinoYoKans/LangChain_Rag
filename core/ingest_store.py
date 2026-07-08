@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -161,32 +161,68 @@ async def mark_job_running(settings: AppSettings, job_id: str) -> None:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
         async with session.begin():
-            job = await session.get(IngestJobModel, UUID(job_id))
-            if job is None:
+            result = await session.execute(
+                update(IngestJobModel)
+                .where(IngestJobModel.id == UUID(job_id), IngestJobModel.status == "pending")
+                .values(status="running", progress=10, error_message=None, updated_at=func.now())
+                .returning(IngestJobModel.id)
+            )
+            if result.first() is not None:
+                return
+            current_status = await session.scalar(select(IngestJobModel.status).where(IngestJobModel.id == UUID(job_id)))
+            if current_status is None:
                 raise ValueError(f"Ingest job not found: {job_id}")
-            if job.status == "cancelled":
+            if current_status == "cancelled":
                 raise IngestJobCancelledError("Ingest job has been cancelled")
-            job.status = "running"
-            job.progress = max(int(job.progress or 0), 10)
-            job.error_message = None
+            raise ValueError(f"Ingest job is not pending: {current_status}")
+
+
+async def mark_stale_pending_jobs_failed(
+    settings: AppSettings,
+    knowledge_base_id: str,
+    stale_after_seconds: int = 1800,
+) -> list[IngestJob]:
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
+    failed_at = datetime.now(timezone.utc)
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            result = await session.scalars(
+                update(IngestJobModel)
+                .where(
+                    IngestJobModel.knowledge_base_id == UUID(knowledge_base_id),
+                    IngestJobModel.status == "pending",
+                    IngestJobModel.created_at < cutoff,
+                )
+                .values(
+                    status="failed",
+                    progress=100,
+                    error_message="Pending timed out before worker pickup. Check worker/Redis health, then retry this job.",
+                    updated_at=failed_at,
+                )
+                .returning(IngestJobModel)
+            )
+            stale_jobs = list(result)
+        return [_job_to_dataclass(job) for job in stale_jobs]
 
 
 async def mark_job_progress(settings: AppSettings, job_id: str, progress: int) -> None:
-    await _update_job(settings, job_id, progress=max(0, min(progress, 99)))
+    await _update_job(settings, job_id, allowed_statuses={"running"}, progress=max(0, min(progress, 99)))
 
 
 async def mark_job_file_id(settings: AppSettings, job_id: str, file_id: str) -> None:
-    await _update_job(settings, job_id, file_id=UUID(file_id))
+    await _update_job(settings, job_id, allowed_statuses={"running"}, file_id=UUID(file_id))
 
 
 async def mark_job_succeeded(settings: AppSettings, job_id: str, *, file_id: str, progress: int = 100) -> None:
-    await _update_job(settings, job_id, status="succeeded", progress=progress, file_id=UUID(file_id))
+    await _update_job(settings, job_id, allowed_statuses={"running"}, status="succeeded", progress=progress, file_id=UUID(file_id))
 
 
 async def mark_job_failed(settings: AppSettings, job_id: str, error_message: str) -> None:
     await _update_job(
         settings,
         job_id,
+        allowed_statuses={"pending", "running"},
         status="failed",
         progress=100,
         error_message=error_message[:4000],
@@ -221,35 +257,44 @@ async def cancel_ingest_job(settings: AppSettings, job_id: str) -> IngestJob:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
         async with session.begin():
-            job = await session.get(IngestJobModel, UUID(job_id))
+            result = await session.scalars(
+                update(IngestJobModel)
+                .where(IngestJobModel.id == UUID(job_id), IngestJobModel.status.in_(("pending", "running")))
+                .values(status="cancelled", progress=100, error_message="Cancelled by user", updated_at=func.now())
+                .returning(IngestJobModel)
+            )
+            job = result.one_or_none()
             if job is None:
-                raise ValueError(f"Ingest job not found: {job_id}")
-            if job.status not in {"pending", "running"}:
+                current = await session.get(IngestJobModel, UUID(job_id))
+                if current is None:
+                    raise ValueError(f"Ingest job not found: {job_id}")
                 raise ValueError("Only pending or running ingest jobs can be cancelled")
-            job.status = "cancelled"
-            job.progress = 100
-            job.error_message = "Cancelled by user"
             if job.file_id:
                 await session.execute(
                     update(RagFileModel)
                     .where(RagFileModel.id == job.file_id, RagFileModel.status.in_(("processing", "failed")))
                     .values(status="deleted", deleted_at=func.now())
                 )
-        await session.refresh(job)
         return _job_to_dataclass(job)
 
 
-async def _update_job(settings: AppSettings, job_id: str, **values: Any) -> None:
+async def _update_job(settings: AppSettings, job_id: str, allowed_statuses: set[str] | None = None, **values: Any) -> None:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
         async with session.begin():
-            job = await session.get(IngestJobModel, UUID(job_id))
-            if job is None:
+            update_values = {**values, "updated_at": func.now()}
+            statement = update(IngestJobModel).where(IngestJobModel.id == UUID(job_id))
+            if allowed_statuses is not None:
+                statement = statement.where(IngestJobModel.status.in_(tuple(allowed_statuses)))
+            result = await session.execute(statement.values(**update_values).returning(IngestJobModel.status))
+            if result.first() is not None:
+                return
+            current_status = await session.scalar(select(IngestJobModel.status).where(IngestJobModel.id == UUID(job_id)))
+            if current_status is None:
                 raise ValueError(f"Ingest job not found: {job_id}")
-            if job.status == "cancelled" and values.get("status") != "cancelled":
+            if current_status == "cancelled" and values.get("status") != "cancelled":
                 raise IngestJobCancelledError("Ingest job has been cancelled")
-            for key, value in values.items():
-                setattr(job, key, value)
+            raise ValueError(f"Ingest job is not in an updatable state: {current_status}")
 
 
 def _job_to_dataclass(model: IngestJobModel) -> IngestJob:

@@ -109,6 +109,7 @@ from core.ingest_store import (
     get_ingest_job,
     get_ingest_queue_health,
     list_ingest_jobs,
+    mark_stale_pending_jobs_failed,
     mark_job_failed,
     retry_failed_ingest_job,
 )
@@ -291,6 +292,41 @@ class FileRecordResponse(BaseModel):
 
 class FileListResponse(BaseModel):
     items: list[FileRecordResponse]
+
+
+class DocumentTaskResponse(BaseModel):
+    id: str
+    task_type: str
+    status: str
+    stage: str
+    progress: int
+    knowledge_base_id: str
+    file_id: str | None = None
+    job_id: str | None = None
+    filename: str | None = None
+    content_type: str | None = None
+    source_type: str | None = None
+    source_uri: str | None = None
+    file_size: int | None = None
+    uploaded_by_user_id: str | None = None
+    chunk_count: int = 0
+    vector_count: int = 0
+    retry_count: int = 0
+    error_message: str | None = None
+    is_stale: bool = False
+    stale_seconds: int | None = None
+    can_retry: bool = False
+    can_cancel: bool = False
+    can_delete: bool = False
+    can_preview: bool = False
+    created_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str
+
+
+class DocumentTaskListResponse(BaseModel):
+    items: list[DocumentTaskResponse]
 
 
 class DeleteDocumentResponse(BaseModel):
@@ -1709,12 +1745,76 @@ def create_app() -> FastAPI:
             user=current_user,
             action="ingest_jobs.list.denied",
         )
+        await reconcile_stale_pending_jobs_or_audit(state.settings, request=http_request, knowledge_base_id=knowledge_base_id)
         return IngestJobListResponse(
             items=[
                 ingest_job_response(item)
                 for item in await list_ingest_jobs(state.settings, knowledge_base_id, limit=limit, status=status)
             ]
         )
+
+    @app.get("/knowledge-bases/{knowledge_base_id}/document-tasks", response_model=DocumentTaskListResponse)
+    async def knowledge_base_document_tasks(
+        http_request: Request,
+        knowledge_base_id: str,
+        limit: int = Query(default=200, ge=1, le=500),
+        status: str = Query(default="all", pattern="^(all|pending|processing|completed|failed|cancelled)$"),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> DocumentTaskListResponse:
+        state = get_state(app)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document_tasks.list.denied",
+        )
+        await reconcile_stale_pending_jobs_or_audit(state.settings, request=http_request, knowledge_base_id=knowledge_base_id)
+        capabilities = await get_knowledge_base_capabilities(state.settings, knowledge_base_id, current_user)
+        files = await list_knowledge_base_files(state.settings, knowledge_base_id, limit=limit, include_deleted=False)
+        jobs = await list_ingest_jobs(state.settings, knowledge_base_id, limit=limit, status="all")
+        items = document_task_responses(
+            files=files,
+            jobs=jobs,
+            can_manage=capabilities.can_manage_settings,
+        )
+        if status != "all":
+            items = [item for item in items if item.status == status]
+        return DocumentTaskListResponse(items=items[:limit])
+
+    @app.get("/knowledge-bases/{knowledge_base_id}/document-tasks/{task_id}", response_model=DocumentTaskResponse)
+    async def knowledge_base_document_task_detail(
+        http_request: Request,
+        knowledge_base_id: str,
+        task_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> DocumentTaskResponse:
+        state = get_state(app)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document_tasks.detail.denied",
+            metadata={"task_id": task_id},
+        )
+        await reconcile_stale_pending_jobs_or_audit(state.settings, request=http_request, knowledge_base_id=knowledge_base_id)
+        capabilities = await get_knowledge_base_capabilities(state.settings, knowledge_base_id, current_user)
+        job = await get_ingest_job(state.settings, task_id)
+        if job is not None:
+            if job.knowledge_base_id != knowledge_base_id:
+                raise HTTPException(status_code=404, detail="Document task not found")
+            file_record = await get_knowledge_base_file(state.settings, knowledge_base_id, job.file_id) if job.file_id else None
+            return document_task_from_job(
+                job,
+                file_record=file_record,
+                can_manage=capabilities.can_manage_settings,
+                now=datetime.now(timezone.utc),
+            )
+        file_record = await get_knowledge_base_file(state.settings, knowledge_base_id, task_id)
+        if file_record is None:
+            raise HTTPException(status_code=404, detail="Document task not found")
+        return document_task_from_file(file_record, can_manage=capabilities.can_manage_settings, now=datetime.now(timezone.utc))
 
     @app.get("/knowledge-bases/{knowledge_base_id}/queue-health", response_model=QueueHealthResponse)
     async def knowledge_base_queue_health(
@@ -1730,6 +1830,7 @@ def create_app() -> FastAPI:
             user=current_user,
             action="queue_health.read.denied",
         )
+        await reconcile_stale_pending_jobs_or_audit(state.settings, request=http_request, knowledge_base_id=knowledge_base_id)
         redis_queue_length = -1
         worker_last_seen_at = None
         try:
@@ -1779,8 +1880,16 @@ def create_app() -> FastAPI:
             kb_id=job.knowledge_base_id,
             user=current_user,
             action="ingest.retry_requested.denied",
-            write=True,
             metadata={"job_id": job_id},
+        )
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=job.knowledge_base_id,
+            user=current_user,
+            action="ingest.retry_requested.denied",
+            capability="settings",
+            metadata=job_audit_metadata(job),
         )
         try:
             retried = await retry_failed_ingest_job(state.settings, job_id)
@@ -1816,8 +1925,16 @@ def create_app() -> FastAPI:
             kb_id=job.knowledge_base_id,
             user=current_user,
             action="ingest.cancel_requested.denied",
-            write=True,
             metadata={"job_id": job_id},
+        )
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=job.knowledge_base_id,
+            user=current_user,
+            action="ingest.cancel_requested.denied",
+            capability="settings",
+            metadata=job_audit_metadata(job),
         )
         try:
             cancelled = await cancel_ingest_job(state.settings, job_id)
@@ -1856,8 +1973,16 @@ def create_app() -> FastAPI:
                     kb_id=job.knowledge_base_id,
                     user=current_user,
                     action="ingest.batch_retry_requested.denied",
-                    write=True,
                     metadata={"job_id": job_id},
+                )
+                await require_kb_capability_or_audit(
+                    state.settings,
+                    request=http_request,
+                    kb_id=job.knowledge_base_id,
+                    user=current_user,
+                    action="ingest.batch_retry_requested.denied",
+                    capability="settings",
+                    metadata=job_audit_metadata(job),
                 )
                 touched_kb_ids.add(job.knowledge_base_id)
                 retried = await retry_failed_ingest_job(state.settings, job_id)
@@ -1902,8 +2027,16 @@ def create_app() -> FastAPI:
                     kb_id=job.knowledge_base_id,
                     user=current_user,
                     action="ingest.batch_cancel_requested.denied",
-                    write=True,
                     metadata={"job_id": job_id},
+                )
+                await require_kb_capability_or_audit(
+                    state.settings,
+                    request=http_request,
+                    kb_id=job.knowledge_base_id,
+                    user=current_user,
+                    action="ingest.batch_cancel_requested.denied",
+                    capability="settings",
+                    metadata=job_audit_metadata(job),
                 )
                 touched_kb_ids.add(job.knowledge_base_id)
                 cancelled = await cancel_ingest_job(state.settings, job_id)
@@ -2022,12 +2155,20 @@ def create_app() -> FastAPI:
             kb_id=knowledge_base_id,
             user=current_user,
             action="document.reindex_requested.denied",
-            write=True,
             metadata={"file_id": file_id},
         )
         item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Document not found")
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.reindex_requested.denied",
+            capability="settings",
+            metadata=file_audit_metadata(item),
+        )
         try:
             payload, source_uri = build_reindex_payload(state.settings, item)
         except ValueError as exc:
@@ -2070,12 +2211,20 @@ def create_app() -> FastAPI:
             kb_id=knowledge_base_id,
             user=current_user,
             action="document.delete.denied",
-            write=True,
             metadata={"file_id": file_id},
         )
         item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Document not found")
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.delete.denied",
+            capability="settings",
+            metadata=file_audit_metadata(item),
+        )
         try:
             delete_documents(state.vector_store, item.vector_ids)
             await delete_file_chunks_by_file_id(state.settings, file_id)
@@ -2110,15 +2259,31 @@ def create_app() -> FastAPI:
             kb_id=knowledge_base_id,
             user=current_user,
             action="document.batch_delete.denied",
-            write=True,
             metadata={"file_count": len(request.file_ids)},
         )
         results: list[BatchItemResult] = []
         for file_id in request.file_ids:
             try:
+                await require_kb_access_or_audit(
+                    state.settings,
+                    request=http_request,
+                    kb_id=knowledge_base_id,
+                    user=current_user,
+                    action="document.batch_delete.denied",
+                    metadata={"file_id": file_id},
+                )
                 item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
                 if item is None:
                     raise ValueError("Document not found")
+                await require_kb_capability_or_audit(
+                    state.settings,
+                    request=http_request,
+                    kb_id=knowledge_base_id,
+                    user=current_user,
+                    action="document.batch_delete.denied",
+                    capability="settings",
+                    metadata=file_audit_metadata(item),
+                )
                 delete_documents(state.vector_store, item.vector_ids)
                 await delete_file_chunks_by_file_id(state.settings, file_id)
                 await delete_document_artifacts(state.settings, file_id)
@@ -2152,15 +2317,31 @@ def create_app() -> FastAPI:
             kb_id=knowledge_base_id,
             user=current_user,
             action="document.batch_reindex_requested.denied",
-            write=True,
             metadata={"file_count": len(request.file_ids)},
         )
         results: list[BatchItemResult] = []
         for file_id in request.file_ids:
             try:
+                await require_kb_access_or_audit(
+                    state.settings,
+                    request=http_request,
+                    kb_id=knowledge_base_id,
+                    user=current_user,
+                    action="document.batch_reindex_requested.denied",
+                    metadata={"file_id": file_id},
+                )
                 item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
                 if item is None:
                     raise ValueError("Document not found")
+                await require_kb_capability_or_audit(
+                    state.settings,
+                    request=http_request,
+                    kb_id=knowledge_base_id,
+                    user=current_user,
+                    action="document.batch_reindex_requested.denied",
+                    capability="settings",
+                    metadata=file_audit_metadata(item),
+                )
                 payload, source_uri = build_reindex_payload(state.settings, item)
                 job = await create_ingest_job(
                     state.settings,
@@ -3714,6 +3895,184 @@ def ingest_job_response(job: IngestJob) -> IngestJobResponse:
     )
 
 
+def document_task_responses(
+    *,
+    files: list[RagFile],
+    jobs: list[IngestJob],
+    can_manage: bool,
+    now: datetime | None = None,
+) -> list[DocumentTaskResponse]:
+    now = now or datetime.now(timezone.utc)
+    file_by_id = {item.id: item for item in files}
+    linked_file_ids = {job.file_id for job in jobs if job.file_id}
+    items: list[DocumentTaskResponse] = []
+    for job in jobs:
+        file_record = file_by_id.get(job.file_id or "")
+        items.append(document_task_from_job(job, file_record=file_record, can_manage=can_manage, now=now))
+    for file_record in files:
+        if file_record.id in linked_file_ids:
+            continue
+        items.append(document_task_from_file(file_record, can_manage=can_manage, now=now))
+    return sorted(items, key=lambda item: item.updated_at, reverse=True)
+
+
+def job_audit_metadata(job: IngestJob) -> dict[str, Any]:
+    return {
+        "knowledge_base_id": job.knowledge_base_id,
+        "job_id": job.id,
+        "file_id": job.file_id,
+        "filename": job.filename,
+        "source_type": job.source_type,
+        "source_uri": job.source_uri,
+        "status": job.status,
+    }
+
+
+def file_audit_metadata(file_record: RagFile) -> dict[str, Any]:
+    return {
+        "knowledge_base_id": file_record.knowledge_base_id,
+        "file_id": file_record.id,
+        "filename": file_record.filename,
+        "source_type": file_record.source_type,
+        "source_uri": file_record.source_uri,
+        "status": file_record.status,
+    }
+
+
+def document_task_from_job(
+    job: IngestJob,
+    *,
+    file_record: RagFile | None,
+    can_manage: bool,
+    now: datetime,
+) -> DocumentTaskResponse:
+    status = ingest_task_status(job.status)
+    stale_seconds = task_stale_seconds(job, now)
+    filename = job.filename or (file_record.filename if file_record else None)
+    content_type = None
+    file_size = None
+    chunk_count = 0
+    vector_count = 0
+    if file_record is not None:
+        content_type = file_record.content_type
+        file_size = file_record.file_size
+        chunk_count = file_record.chunk_count
+        vector_count = len(file_record.vector_ids)
+    else:
+        content_type = str(job.payload.get("content_type") or "") or None
+        file_size = int(job.payload["file_size"]) if job.payload.get("file_size") is not None else None
+    can_retry = can_manage and job.status == "failed"
+    can_cancel = can_manage and job.status in {"pending", "running"}
+    can_delete = can_manage and bool(file_record) and file_record.status != "deleted"
+    terminal = job.status in {"succeeded", "failed", "cancelled"}
+    return DocumentTaskResponse(
+        id=job.id,
+        task_type="ingest_job",
+        status=status,
+        stage=ingest_task_stage(job),
+        progress=job.progress,
+        knowledge_base_id=job.knowledge_base_id,
+        file_id=job.file_id,
+        job_id=job.id,
+        filename=filename,
+        content_type=content_type,
+        source_type=job.source_type,
+        source_uri=job.source_uri,
+        file_size=file_size,
+        uploaded_by_user_id=job.created_by_user_id,
+        chunk_count=chunk_count,
+        vector_count=vector_count,
+        retry_count=job.retry_count,
+        error_message=job.error_message,
+        is_stale=stale_seconds is not None,
+        stale_seconds=stale_seconds,
+        can_retry=can_retry,
+        can_cancel=can_cancel,
+        can_delete=can_delete,
+        can_preview=bool(file_record and file_record.status == "completed"),
+        created_at=job.created_at.isoformat(),
+        started_at=job.updated_at.isoformat() if job.status == "running" else None,
+        completed_at=job.updated_at.isoformat() if terminal else None,
+        updated_at=job.updated_at.isoformat(),
+    )
+
+
+def document_task_from_file(file_record: RagFile, *, can_manage: bool, now: datetime) -> DocumentTaskResponse:
+    status = "completed" if file_record.status == "completed" else file_record.status
+    stage = {
+        "processing": "indexing",
+        "completed": "ready",
+        "failed": "failed",
+        "deleted": "deleted",
+    }.get(file_record.status, file_record.status)
+    terminal = file_record.status in {"completed", "failed", "deleted"}
+    return DocumentTaskResponse(
+        id=file_record.id,
+        task_type="file",
+        status=status,
+        stage=stage,
+        progress=100 if terminal else 50,
+        knowledge_base_id=file_record.knowledge_base_id or "",
+        file_id=file_record.id,
+        job_id=None,
+        filename=file_record.filename,
+        content_type=file_record.content_type,
+        source_type=file_record.source_type,
+        source_uri=file_record.source_uri,
+        file_size=file_record.file_size,
+        uploaded_by_user_id=file_record.owner_user_id or file_record.user_id,
+        chunk_count=file_record.chunk_count,
+        vector_count=len(file_record.vector_ids),
+        error_message=file_record.error_message,
+        can_delete=can_manage and file_record.status != "deleted",
+        can_preview=file_record.status == "completed",
+        created_at=file_record.created_at.isoformat(),
+        started_at=file_record.created_at.isoformat() if file_record.status == "processing" else None,
+        completed_at=file_record.updated_at.isoformat() if terminal else None,
+        updated_at=file_record.updated_at.isoformat(),
+    )
+
+
+def ingest_task_status(status: str) -> str:
+    return {
+        "pending": "pending",
+        "running": "processing",
+        "succeeded": "completed",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }.get(status, status)
+
+
+def ingest_task_stage(job: IngestJob) -> str:
+    if job.status == "pending":
+        return "waiting_worker"
+    if job.status == "cancelled":
+        return "cancelled"
+    if job.status == "failed":
+        return "failed"
+    if job.status == "succeeded":
+        return "ready"
+    if job.progress < 25:
+        return "starting"
+    if job.progress < 45:
+        return "parsing"
+    if job.progress < 70:
+        return "chunking"
+    if job.progress < 85:
+        return "embedding"
+    return "persisting"
+
+
+def task_stale_seconds(job: IngestJob, now: datetime) -> int | None:
+    if job.status == "pending":
+        waited = seconds_since(job.created_at, now)
+        return waited if waited is not None and waited > 300 else None
+    if job.status == "running":
+        waited = seconds_since(job.updated_at, now)
+        return waited if waited is not None and waited > 900 else None
+    return None
+
+
 def batch_response(items: list[BatchItemResult]) -> BatchOperationResponse:
     failed = sum(1 for item in items if item.status == "failed")
     skipped = sum(1 for item in items if item.status == "skipped")
@@ -3961,6 +4320,7 @@ async def require_kb_capability_or_audit(
     user: CurrentUser,
     action: str,
     capability: str,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     try:
         if capability == "members":
@@ -3981,9 +4341,34 @@ async def require_kb_capability_or_audit(
                 target_type="knowledge_base",
                 target_id=kb_id,
                 error=exc,
-                metadata={"knowledge_base_id": kb_id, "required_capability": capability},
+                metadata={"knowledge_base_id": kb_id, "required_capability": capability, **(metadata or {})},
             )
         raise
+
+
+async def reconcile_stale_pending_jobs_or_audit(settings: AppSettings, *, request: Request, knowledge_base_id: str) -> None:
+    stale_jobs = await mark_stale_pending_jobs_failed(settings, knowledge_base_id)
+    for job in stale_jobs:
+        await add_audit_log(
+            settings,
+            org_id=job.org_id,
+            actor_user_id=job.created_by_user_id,
+            action="ingest.failed",
+            target_type="ingest_job",
+            target_id=job.id,
+            metadata={
+                "knowledge_base_id": job.knowledge_base_id,
+                "job_id": job.id,
+                "file_id": job.file_id,
+                "filename": job.filename,
+                "source_type": job.source_type,
+                "source_uri": job.source_uri,
+                "reason": "pending_timeout",
+            },
+            result="failed",
+            error_message=job.error_message,
+            **audit_context(request),
+        )
 
 
 async def manageable_knowledge_base_ids(settings: AppSettings, user: CurrentUser) -> list[str]:

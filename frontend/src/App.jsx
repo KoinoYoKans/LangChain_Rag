@@ -168,6 +168,8 @@ function KnowledgeWorkspace({ api, user }) {
   const [preview, setPreview] = useState(null);
   const [editingKb, setEditingKb] = useState(null);
   const [fileStatus, setFileStatus] = useState("");
+  const [taskStatus, setTaskStatus] = useState("all");
+  const [taskDetail, setTaskDetail] = useState(null);
   const [selectedFileIds, setSelectedFileIds] = useState([]);
   const [selectedJobIds, setSelectedJobIds] = useState([]);
   const [urlPlan, setUrlPlan] = useState(null);
@@ -181,6 +183,7 @@ function KnowledgeWorkspace({ api, user }) {
   const activeKb = selectedKb || kbs.data?.[0]?.id || "";
   const activeKbRecord = (kbs.data || []).find((item) => item.id === activeKb);
   const canWriteKb = Boolean(activeKbRecord?.can_write);
+  const canManageKb = Boolean(activeKbRecord?.can_manage_settings);
   const canManageMembers = Boolean(activeKbRecord?.can_manage_members);
   const memberCandidates = useQuery({
     queryKey: ["kb-member-candidates", activeKb],
@@ -196,6 +199,12 @@ function KnowledgeWorkspace({ api, user }) {
     queryKey: ["files", activeKb, fileStatus],
     enabled: Boolean(activeKb),
     queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/documents`, { params: fileStatus ? { status: fileStatus } : {} })).data.items || [],
+  });
+  const documentTasks = useQuery({
+    queryKey: ["document-tasks", activeKb, taskStatus],
+    enabled: Boolean(activeKb),
+    refetchInterval: 2500,
+    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/document-tasks`, { params: { status: taskStatus } })).data.items || [],
   });
   const activeJobs = useQuery({
     queryKey: ["jobs", activeKb, "active"],
@@ -532,10 +541,57 @@ function KnowledgeWorkspace({ api, user }) {
           </div>
         )}
         <Flex justify="space-between" align="center" className="table-tools">
+          <Typography.Title level={5}>文档处理任务中心</Typography.Title>
+          <Space wrap>
+            <Select
+              value={taskStatus}
+              onChange={setTaskStatus}
+              style={{ width: 160 }}
+              options={[
+                { value: "all", label: "全部任务" },
+                { value: "pending", label: "等待中" },
+                { value: "processing", label: "处理中" },
+                { value: "completed", label: "已完成" },
+                { value: "failed", label: "失败" },
+                { value: "cancelled", label: "已取消" },
+              ]}
+            />
+          </Space>
+        </Flex>
+        <Table
+          rowKey="id"
+          size="middle"
+          loading={documentTasks.isLoading}
+          dataSource={documentTasks.data || []}
+          columns={[
+            { title: "文件/来源", render: (_, row) => <Space direction="vertical" size={0}><strong>{row.filename || row.source_uri || row.id}</strong><span className="muted">{row.content_type || row.source_type || "-"} · {formatBytes(row.file_size)}</span></Space> },
+            { title: "状态", width: 140, render: (_, row) => <Space direction="vertical" size={0}><Tag color={taskStatusColor(row.status)}>{taskStatusText(row.status)}</Tag>{row.is_stale && <span className="danger-text">等待超时 {row.stale_seconds}s</span>}</Space> },
+            { title: "阶段", dataIndex: "stage", width: 120, render: taskStageText },
+            { title: "进度", dataIndex: "progress", width: 170, render: (value) => <Progress percent={value} size="small" status={value >= 100 ? undefined : "active"} /> },
+            { title: "分块/向量", width: 110, render: (_, row) => `${row.chunk_count || 0}/${row.vector_count || 0}` },
+            { title: "上传人", dataIndex: "uploaded_by_user_id", width: 110, render: (value) => value?.slice(0, 8) || "-" },
+            { title: "更新时间", dataIndex: "updated_at", width: 180, render: formatTime },
+            { title: "错误", dataIndex: "error_message", ellipsis: true, render: (value) => value || "-" },
+            {
+              title: "操作",
+              width: 280,
+              render: (_, row) => (
+                <Space>
+                  <Button size="small" icon={<EyeOutlined />} onClick={() => setTaskDetail(row)}>详情</Button>
+                  {row.can_preview && <Button size="small" onClick={() => setPreview({ id: row.file_id, filename: row.filename })}>预览</Button>}
+                  {row.can_retry && <Button size="small" onClick={() => retryJob.mutate(row.job_id)}>重试</Button>}
+                  {row.can_cancel && <Button size="small" danger onClick={() => cancelJob.mutate(row.job_id)}>取消</Button>}
+                  {row.can_delete && <Button size="small" danger icon={<DeleteOutlined />} onClick={() => deleteDoc.mutate(row.file_id)} />}
+                </Space>
+              ),
+            },
+          ]}
+        />
+        <Flex justify="space-between" align="center" className="table-tools">
           <Typography.Title level={5}>文件</Typography.Title>
           <Space wrap>
-            <Button disabled={!canWriteKb || !selectedFileIds.length} icon={<ReloadOutlined />} onClick={() => batchReindexDocs.mutate(selectedFileIds)}>批量重建</Button>
-            <Button disabled={!canWriteKb || !selectedFileIds.length} danger icon={<DeleteOutlined />} onClick={() => batchDeleteDocs.mutate(selectedFileIds)}>批量删除</Button>
+            <Button disabled={!canManageKb || !selectedFileIds.length} icon={<ReloadOutlined />} onClick={() => batchReindexDocs.mutate(selectedFileIds)}>批量重建</Button>
+            <Button disabled={!canManageKb || !selectedFileIds.length} danger icon={<DeleteOutlined />} onClick={() => batchDeleteDocs.mutate(selectedFileIds)}>批量删除</Button>
             <Select
               value={fileStatus}
               onChange={setFileStatus}
@@ -555,7 +611,7 @@ function KnowledgeWorkspace({ api, user }) {
           size="middle"
           loading={files.isLoading}
           dataSource={files.data || []}
-          rowSelection={canWriteKb ? { selectedRowKeys: selectedFileIds, onChange: setSelectedFileIds } : undefined}
+          rowSelection={canManageKb ? { selectedRowKeys: selectedFileIds, onChange: setSelectedFileIds } : undefined}
           columns={[
             { title: "文件", dataIndex: "filename", render: (value, row) => <Space direction="vertical" size={0}><strong>{value}</strong><span className="muted">{row.content_type}</span></Space> },
             { title: "状态", dataIndex: "status", width: 120, render: (value) => <Tag color={value === "completed" ? "green" : value === "failed" ? "red" : "blue"}>{value}</Tag> },
@@ -568,8 +624,8 @@ function KnowledgeWorkspace({ api, user }) {
               render: (_, row) => (
                 <Space>
                   <Button icon={<EyeOutlined />} onClick={() => setPreview(row)}>预览</Button>
-                  {canWriteKb && <Button icon={<ReloadOutlined />} onClick={() => reindexDoc.mutate(row.id)}>重建</Button>}
-                  {canWriteKb && <Button danger icon={<DeleteOutlined />} onClick={() => deleteDoc.mutate(row.id)} />}
+                  {canManageKb && <Button icon={<ReloadOutlined />} onClick={() => reindexDoc.mutate(row.id)}>重建</Button>}
+                  {canManageKb && <Button danger icon={<DeleteOutlined />} onClick={() => deleteDoc.mutate(row.id)} />}
                 </Space>
               ),
             },
@@ -577,20 +633,20 @@ function KnowledgeWorkspace({ api, user }) {
         />
         <Typography.Title level={5}>入库任务</Typography.Title>
         <Space className="table-tools" wrap>
-          <Button disabled={!canWriteKb || !selectedJobIds.length} onClick={() => batchRetryJobs.mutate(selectedJobIds)}>批量重试失败</Button>
-          <Button disabled={!canWriteKb || !selectedJobIds.length} danger onClick={() => batchCancelJobs.mutate(selectedJobIds)}>批量取消</Button>
+          <Button disabled={!canManageKb || !selectedJobIds.length} onClick={() => batchRetryJobs.mutate(selectedJobIds)}>批量重试失败</Button>
+          <Button disabled={!canManageKb || !selectedJobIds.length} danger onClick={() => batchCancelJobs.mutate(selectedJobIds)}>批量取消</Button>
         </Space>
         <Tabs
           items={[
             {
               key: "active",
               label: `处理中 ${activeJobs.data?.length || 0}`,
-              children: <JobTable jobs={activeJobs.data || []} loading={activeJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} canWrite={canWriteKb} />,
+              children: <JobTable jobs={activeJobs.data || []} loading={activeJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} canWrite={canManageKb} />,
             },
             {
               key: "history",
               label: <span><HistoryOutlined /> 历史 {historyJobs.data?.length || 0}</span>,
-              children: <JobTable jobs={historyJobs.data || []} loading={historyJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} canWrite={canWriteKb} />,
+              children: <JobTable jobs={historyJobs.data || []} loading={historyJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} canWrite={canManageKb} />,
             },
           ]}
         />
@@ -637,6 +693,29 @@ function KnowledgeWorkspace({ api, user }) {
         )}
       </div>
       <DocumentPreview api={api} kbId={activeKb} file={preview} onClose={() => setPreview(null)} />
+      <Modal title="文档处理详情" open={Boolean(taskDetail)} footer={<Button onClick={() => setTaskDetail(null)}>关闭</Button>} onCancel={() => setTaskDetail(null)} width={760}>
+        {taskDetail && (
+          <Descriptions
+            bordered
+            column={1}
+            size="small"
+            items={[
+              { key: "id", label: "任务 ID", children: taskDetail.id },
+              { key: "file", label: "文件 ID", children: taskDetail.file_id || "-" },
+              { key: "job", label: "入库任务 ID", children: taskDetail.job_id || "-" },
+              { key: "status", label: "状态", children: `${taskStatusText(taskDetail.status)} · ${taskStageText(taskDetail.stage)} · ${taskDetail.progress}%` },
+              { key: "source", label: "来源", children: taskDetail.source_uri || taskDetail.filename || "-" },
+              { key: "counts", label: "分块/向量", children: `${taskDetail.chunk_count || 0}/${taskDetail.vector_count || 0}` },
+              { key: "retry", label: "重试次数", children: taskDetail.retry_count || 0 },
+              { key: "created", label: "创建时间", children: formatTime(taskDetail.created_at) },
+              { key: "started", label: "开始时间", children: formatTime(taskDetail.started_at) },
+              { key: "completed", label: "完成时间", children: formatTime(taskDetail.completed_at) },
+              { key: "updated", label: "更新时间", children: formatTime(taskDetail.updated_at) },
+              { key: "error", label: "错误信息", children: taskDetail.error_message || "-" },
+            ]}
+          />
+        )}
+      </Modal>
       <Modal
         title="编辑知识库"
         open={Boolean(editingKb)}
@@ -1543,6 +1622,7 @@ function buildApi(token) {
 function refreshKnowledge(queryClient, kbId) {
   queryClient.invalidateQueries({ queryKey: ["files", kbId] });
   queryClient.invalidateQueries({ queryKey: ["jobs", kbId] });
+  queryClient.invalidateQueries({ queryKey: ["document-tasks", kbId] });
   queryClient.invalidateQueries({ queryKey: ["queue-health", kbId] });
 }
 
@@ -1675,6 +1755,52 @@ function compactParams(values = {}) {
 function formatTime(value) {
   if (!value) return "-";
   return new Date(value).toLocaleString();
+}
+
+function formatBytes(value) {
+  if (value == null) return "-";
+  const size = Number(value);
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function taskStatusText(value) {
+  return {
+    pending: "等待中",
+    processing: "处理中",
+    completed: "已完成",
+    failed: "失败",
+    cancelled: "已取消",
+    deleted: "已删除",
+  }[value] || value || "-";
+}
+
+function taskStatusColor(value) {
+  return {
+    pending: "gold",
+    processing: "blue",
+    completed: "green",
+    failed: "red",
+    cancelled: "default",
+    deleted: "default",
+  }[value] || "default";
+}
+
+function taskStageText(value) {
+  return {
+    waiting_worker: "等待 Worker",
+    starting: "启动",
+    parsing: "解析",
+    chunking: "切分",
+    embedding: "向量化",
+    indexing: "索引中",
+    persisting: "写入",
+    ready: "可用",
+    failed: "失败",
+    cancelled: "已取消",
+    deleted: "已删除",
+  }[value] || value || "-";
 }
 
 function scoreText(value) {
