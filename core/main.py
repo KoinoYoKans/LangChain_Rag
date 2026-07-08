@@ -69,18 +69,21 @@ from core.enterprise_store import (
     get_user_by_id,
     get_knowledge_base_capabilities,
     get_knowledge_base_stats,
+    list_knowledge_base_grants,
     list_knowledge_base_members,
     list_audit_logs,
     list_chat_operations,
     list_departments,
     list_knowledge_bases,
     list_users,
+    remove_knowledge_base_grant,
     remove_knowledge_base_member,
     require_knowledge_base_access,
     reset_user_password,
     soft_delete_knowledge_base,
     update_knowledge_base,
     update_user,
+    upsert_knowledge_base_grant,
     upsert_knowledge_base_member,
 )
 from core.feedback_store import Feedback, create_feedback, list_feedback
@@ -496,6 +499,29 @@ class KnowledgeBaseMemberResponse(BaseModel):
 
 class KnowledgeBaseMemberListResponse(BaseModel):
     items: list[KnowledgeBaseMemberResponse]
+
+
+class KnowledgeBaseGrantUpsertRequest(BaseModel):
+    subject_type: str = Field(pattern="^(user|department)$")
+    subject_id: str = Field(min_length=1)
+    role: str = Field(pattern="^(viewer|editor|admin)$")
+
+
+class KnowledgeBaseGrantResponse(BaseModel):
+    id: str
+    knowledge_base_id: str
+    subject_type: str
+    subject_id: str
+    subject_name: str | None
+    subject_email: str | None
+    role: str
+    granted_by_user_id: str | None
+    created_at: str
+    updated_at: str
+
+
+class KnowledgeBaseGrantListResponse(BaseModel):
+    items: list[KnowledgeBaseGrantResponse]
 
 
 class UrlIngestRequest(BaseModel):
@@ -1188,6 +1214,153 @@ def create_app() -> FastAPI:
         )
         return {"items": [user_response(item) for item in await list_users(settings, current_user.org_id) if item.is_active]}
 
+    @app.get("/knowledge-bases/{knowledge_base_id}/grants", response_model=KnowledgeBaseGrantListResponse)
+    async def knowledge_base_grants_endpoint(
+        http_request: Request,
+        knowledge_base_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> KnowledgeBaseGrantListResponse:
+        settings = get_state(app).settings
+        await require_kb_access_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.grants.denied",
+        )
+        capabilities = await get_knowledge_base_capabilities(settings, knowledge_base_id, current_user)
+        grants = await list_knowledge_base_grants(settings, knowledge_base_id)
+        if not capabilities.can_manage_members:
+            grants = [
+                item
+                for item in grants
+                if (item.subject_type == "user" and item.subject_id == current_user.id)
+                or (
+                    item.subject_type == "department"
+                    and current_user.department_id is not None
+                    and item.subject_id == current_user.department_id
+                )
+            ]
+        return KnowledgeBaseGrantListResponse(items=[kb_grant_response(item) for item in grants])
+
+    @app.put("/knowledge-bases/{knowledge_base_id}/grants", response_model=KnowledgeBaseGrantResponse)
+    async def upsert_knowledge_base_grant_endpoint(
+        http_request: Request,
+        knowledge_base_id: str,
+        request: KnowledgeBaseGrantUpsertRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> KnowledgeBaseGrantResponse:
+        settings = get_state(app).settings
+        await require_kb_access_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.grant_upsert.denied",
+            write=True,
+        )
+        await require_kb_capability_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.grant_upsert.denied",
+            capability="members",
+            metadata={"subject_type": request.subject_type, "subject_id": request.subject_id},
+        )
+        grant, old_role = await upsert_knowledge_base_grant(
+            settings,
+            kb_id=knowledge_base_id,
+            subject_type=request.subject_type,
+            subject_id=request.subject_id,
+            role=request.role,
+            granted_by_user_id=current_user.id,
+        )
+        revoked_key_count = 0
+        if request.role != "admin":
+            revoked_key_count = await revoke_api_keys_for_grant_subject_without_admin(
+                settings,
+                kb_id=knowledge_base_id,
+                org_id=current_user.org_id,
+                subject_type=request.subject_type,
+                subject_id=request.subject_id,
+            )
+        await add_audit_log(
+            settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="knowledge_base.grant_upsert",
+            target_type="knowledge_base",
+            target_id=knowledge_base_id,
+            metadata={
+                "subject_type": request.subject_type,
+                "subject_id": request.subject_id,
+                "subject_name": grant.subject_name,
+                "subject_email": grant.subject_email,
+                "old_role": old_role,
+                "new_role": request.role,
+                "revoked_api_key_count": revoked_key_count,
+            },
+            **audit_context(http_request),
+        )
+        return kb_grant_response(grant)
+
+    @app.delete("/knowledge-bases/{knowledge_base_id}/grants/{grant_id}")
+    async def delete_knowledge_base_grant_endpoint(
+        http_request: Request,
+        knowledge_base_id: str,
+        grant_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, str]:
+        settings = get_state(app).settings
+        await require_kb_access_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.grant_remove.denied",
+            write=True,
+        )
+        await require_kb_capability_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.grant_remove.denied",
+            capability="members",
+            metadata={"grant_id": grant_id},
+        )
+        grant = await remove_knowledge_base_grant(settings, kb_id=knowledge_base_id, grant_id=grant_id)
+        revoked_key_count = await revoke_api_keys_for_grant_subject_without_admin(
+            settings,
+            kb_id=knowledge_base_id,
+            org_id=current_user.org_id,
+            subject_type=grant.subject_type,
+            subject_id=grant.subject_id,
+        )
+        await add_audit_log(
+            settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="knowledge_base.grant_remove",
+            target_type="knowledge_base",
+            target_id=knowledge_base_id,
+            metadata={
+                "grant_id": grant.id,
+                "subject_type": grant.subject_type,
+                "subject_id": grant.subject_id,
+                "subject_name": grant.subject_name,
+                "subject_email": grant.subject_email,
+                "old_role": grant.role,
+                "new_role": None,
+                "revoked_api_key_count": revoked_key_count,
+            },
+            **audit_context(http_request),
+        )
+        return {"status": "ok"}
+
     @app.put("/knowledge-bases/{knowledge_base_id}/members", response_model=KnowledgeBaseMemberResponse)
     async def upsert_knowledge_base_member_endpoint(
         http_request: Request,
@@ -1217,6 +1390,15 @@ def create_app() -> FastAPI:
             kb_id=knowledge_base_id,
             user_id=request.user_id,
             role=request.role,
+        )
+        grant_role = "admin" if request.role == "owner" else request.role
+        await upsert_knowledge_base_grant(
+            settings,
+            kb_id=knowledge_base_id,
+            subject_type="user",
+            subject_id=request.user_id,
+            role=grant_role,
+            granted_by_user_id=current_user.id,
         )
         revoked_key_count = 0
         if request.role != "owner":
@@ -3874,6 +4056,21 @@ def kb_member_response(member: Any) -> KnowledgeBaseMemberResponse:
     )
 
 
+def kb_grant_response(grant: Any) -> KnowledgeBaseGrantResponse:
+    return KnowledgeBaseGrantResponse(
+        id=grant.id,
+        knowledge_base_id=grant.knowledge_base_id,
+        subject_type=grant.subject_type,
+        subject_id=grant.subject_id,
+        subject_name=grant.subject_name,
+        subject_email=grant.subject_email,
+        role=grant.role,
+        granted_by_user_id=grant.granted_by_user_id,
+        created_at=grant.created_at.isoformat(),
+        updated_at=grant.updated_at.isoformat(),
+    )
+
+
 def ingest_job_response(job: IngestJob) -> IngestJobResponse:
     return IngestJobResponse(
         id=job.id,
@@ -4254,6 +4451,33 @@ async def require_kb_api_key_admin(settings: AppSettings, kb_id: str, user: Curr
     if capabilities.can_manage_api_keys:
         return
     raise HTTPException(status_code=403, detail="Knowledge base API key management denied")
+
+
+async def revoke_api_keys_for_grant_subject_without_admin(
+    settings: AppSettings,
+    *,
+    kb_id: str,
+    org_id: str,
+    subject_type: str,
+    subject_id: str,
+) -> int:
+    affected_users = []
+    if subject_type == "user":
+        user = await get_user_by_id(settings, subject_id)
+        if user is not None and user.org_id == org_id:
+            affected_users = [user]
+    elif subject_type == "department":
+        affected_users = [
+            user
+            for user in await list_users(settings, org_id)
+            if user.department_id == subject_id and user.is_active
+        ]
+    revoked = 0
+    for user in affected_users:
+        capabilities = await get_knowledge_base_capabilities(settings, kb_id, user)
+        if not capabilities.can_manage_api_keys:
+            revoked += await revoke_api_keys_for_kb_user(settings, kb_id=kb_id, user_id=user.id)
+    return revoked
 
 
 async def audit_access_denied(

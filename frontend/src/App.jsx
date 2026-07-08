@@ -178,6 +178,7 @@ function KnowledgeWorkspace({ api, user }) {
   const [editForm] = Form.useForm();
   const [memberForm] = Form.useForm();
   const [urlForm] = Form.useForm();
+  const grantSubjectType = Form.useWatch("subject_type", memberForm) || "user";
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
   const departments = useQuery({ queryKey: ["departments"], queryFn: async () => (await api.get("/departments")).data.items || [] });
   const activeKb = selectedKb || kbs.data?.[0]?.id || "";
@@ -190,10 +191,10 @@ function KnowledgeWorkspace({ api, user }) {
     enabled: Boolean(activeKb && activeKbRecord?.can_manage_members),
     queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/member-candidates`)).data.items || [],
   });
-  const members = useQuery({
-    queryKey: ["kb-members", activeKb],
-    enabled: Boolean(activeKb && activeKbRecord?.can_manage_members),
-    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/members`)).data.items || [],
+  const grants = useQuery({
+    queryKey: ["kb-grants", activeKb],
+    enabled: Boolean(activeKb),
+    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/grants`)).data.items || [],
   });
   const files = useQuery({
     queryKey: ["files", activeKb, fileStatus],
@@ -351,22 +352,22 @@ function KnowledgeWorkspace({ api, user }) {
     },
     onError: (error) => message.error(readError(error)),
   });
-  const upsertMember = useMutation({
-    mutationFn: (values) => api.put(`/knowledge-bases/${activeKb}/members`, values),
+  const upsertGrant = useMutation({
+    mutationFn: (values) => api.put(`/knowledge-bases/${activeKb}/grants`, values),
     onSuccess: () => {
       memberForm.resetFields();
-      queryClient.invalidateQueries({ queryKey: ["kb-members", activeKb] });
+      queryClient.invalidateQueries({ queryKey: ["kb-grants", activeKb] });
       queryClient.invalidateQueries({ queryKey: ["kbs"] });
-      message.success("成员权限已保存");
+      message.success("授权已保存");
     },
     onError: (error) => message.error(readError(error)),
   });
-  const removeMember = useMutation({
-    mutationFn: (userId) => api.delete(`/knowledge-bases/${activeKb}/members/${userId}`),
+  const removeGrant = useMutation({
+    mutationFn: (grantId) => api.delete(`/knowledge-bases/${activeKb}/grants/${grantId}`),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["kb-members", activeKb] });
+      queryClient.invalidateQueries({ queryKey: ["kb-grants", activeKb] });
       queryClient.invalidateQueries({ queryKey: ["kbs"] });
-      message.success("成员已移除");
+      message.success("授权已移除");
     },
     onError: (error) => message.error(readError(error)),
   });
@@ -650,47 +651,81 @@ function KnowledgeWorkspace({ api, user }) {
             },
           ]}
         />
+        <Typography.Title level={5}>成员与部门权限</Typography.Title>
         {canManageMembers && (
-          <>
-            <Typography.Title level={5}>成员权限</Typography.Title>
-            <Form form={memberForm} layout="inline" className="url-form" onFinish={(values) => upsertMember.mutate(values)}>
-              <Form.Item name="user_id" rules={[{ required: true }]} className="kb-select">
-                <Select
-                  showSearch
-                  placeholder="选择用户"
-                  optionFilterProp="label"
-                  options={(memberCandidates.data || []).map((item) => ({ value: item.id, label: `${item.display_name} · ${item.email}` }))}
-                />
-              </Form.Item>
-              <Form.Item name="role" rules={[{ required: true }]} initialValue="viewer">
-                <Select style={{ width: 140 }} options={[
-                  { value: "viewer", label: "viewer" },
-                  { value: "editor", label: "editor" },
-                  { value: "owner", label: "owner" },
-                ]} />
-              </Form.Item>
-              <Button type="primary" htmlType="submit" loading={upsertMember.isPending}>授权</Button>
-            </Form>
-            <Table
-              rowKey="user_id"
-              size="small"
-              loading={members.isLoading}
-              pagination={false}
-              dataSource={members.data || []}
-              columns={[
-                { title: "成员", render: (_, row) => <Space direction="vertical" size={0}><strong>{row.display_name}</strong><span className="muted">{row.email}</span></Space> },
-                { title: "角色", dataIndex: "role", width: 120, render: (value) => <Tag color={value === "owner" ? "purple" : value === "editor" ? "blue" : "default"}>{value}</Tag> },
-                { title: "部门", dataIndex: "department_id", width: 120, render: (value) => value?.slice(0, 8) || "-" },
-                { title: "加入时间", dataIndex: "created_at", width: 180, render: formatTime },
-                {
-                  title: "操作",
-                  width: 90,
-                  render: (_, row) => row.role === "owner" ? "-" : <Button size="small" danger onClick={() => removeMember.mutate(row.user_id)}>移除</Button>,
-                },
-              ]}
-            />
-          </>
+          <Form
+            form={memberForm}
+            layout="inline"
+            className="url-form"
+            initialValues={{ subject_type: "user", role: "viewer" }}
+            onFinish={(values) => upsertGrant.mutate(values)}
+          >
+            <Form.Item name="subject_type" rules={[{ required: true }]}>
+              <Select
+                style={{ width: 120 }}
+                options={[
+                  { value: "user", label: "用户" },
+                  { value: "department", label: "部门" },
+                ]}
+                onChange={() => memberForm.resetFields(["subject_id"])}
+              />
+            </Form.Item>
+            <Form.Item name="subject_id" rules={[{ required: true }]} className="kb-select">
+              <Select
+                showSearch
+                placeholder={grantSubjectType === "department" ? "选择部门" : "选择用户"}
+                optionFilterProp="label"
+                options={
+                  grantSubjectType === "department"
+                    ? (departments.data || []).map((item) => ({ value: item.id, label: item.name }))
+                    : (memberCandidates.data || []).map((item) => ({ value: item.id, label: `${item.display_name} · ${item.email}` }))
+                }
+              />
+            </Form.Item>
+            <Form.Item name="role" rules={[{ required: true }]}>
+              <Select style={{ width: 140 }} options={[
+                { value: "viewer", label: "viewer" },
+                { value: "editor", label: "editor" },
+                { value: "admin", label: "admin" },
+              ]} />
+            </Form.Item>
+            <Button type="primary" htmlType="submit" loading={upsertGrant.isPending}>授权</Button>
+          </Form>
         )}
+        <Table
+          rowKey="id"
+          size="small"
+          loading={grants.isLoading}
+          pagination={false}
+          dataSource={grants.data || []}
+          columns={[
+            {
+              title: "授权对象",
+              render: (_, row) => (
+                <Space direction="vertical" size={0}>
+                  <strong>{row.subject_name || row.subject_id}</strong>
+                  <span className="muted">
+                    {row.subject_type === "department" ? "部门" : row.subject_email || "用户"}
+                  </span>
+                </Space>
+              ),
+            },
+            {
+              title: "类型",
+              dataIndex: "subject_type",
+              width: 90,
+              render: (value) => <Tag icon={value === "department" ? <BankOutlined /> : <TeamOutlined />}>{value === "department" ? "部门" : "用户"}</Tag>,
+            },
+            { title: "角色", dataIndex: "role", width: 120, render: (value) => <Tag color={value === "admin" ? "purple" : value === "editor" ? "blue" : "default"}>{value}</Tag> },
+            { title: "授权人", dataIndex: "granted_by_user_id", width: 110, render: (value) => value?.slice(0, 8) || "-" },
+            { title: "更新时间", dataIndex: "updated_at", width: 180, render: formatTime },
+            {
+              title: "操作",
+              width: 90,
+              render: (_, row) => canManageMembers ? <Button size="small" danger onClick={() => removeGrant.mutate(row.id)}>移除</Button> : "-",
+            },
+          ]}
+        />
       </div>
       <DocumentPreview api={api} kbId={activeKb} file={preview} onClose={() => setPreview(null)} />
       <Modal title="文档处理详情" open={Boolean(taskDetail)} footer={<Button onClick={() => setTaskDetail(null)}>关闭</Button>} onCancel={() => setTaskDetail(null)} width={760}>

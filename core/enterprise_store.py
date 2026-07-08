@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import array, insert
 
 from config.database import (
@@ -16,6 +16,7 @@ from config.database import (
     FeedbackModel,
     IngestJobModel,
     KnowledgeBaseMemberModel,
+    KnowledgeBaseGrantModel,
     KnowledgeBaseModel,
     OrganizationModel,
     RagFileModel,
@@ -94,6 +95,20 @@ class KnowledgeBaseMember:
     display_name: str | None
     department_id: str | None
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class KnowledgeBaseGrant:
+    id: str
+    knowledge_base_id: str
+    subject_type: str
+    subject_id: str
+    subject_name: str | None
+    subject_email: str | None
+    role: str
+    granted_by_user_id: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True)
@@ -346,11 +361,20 @@ async def create_knowledge_base(
         status="active",
     )
     member = KnowledgeBaseMemberModel(id=uuid4(), knowledge_base_id=kb.id, user_id=UUID(user.id), role="owner")
+    grant = KnowledgeBaseGrantModel(
+        id=uuid4(),
+        knowledge_base_id=kb.id,
+        subject_type="user",
+        subject_id=UUID(user.id),
+        role="admin",
+        granted_by_user_id=UUID(user.id),
+    )
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
         async with session.begin():
             session.add(kb)
             session.add(member)
+            session.add(grant)
         await session.refresh(kb)
         return _kb_to_dataclass(kb)
 
@@ -467,6 +491,153 @@ async def list_knowledge_base_members(settings: AppSettings, kb_id: str) -> list
         return [_member_to_dataclass(member, user) for member, user in rows]
 
 
+async def list_knowledge_base_grants(settings: AppSettings, kb_id: str) -> list[KnowledgeBaseGrant]:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        grants = (
+            await session.scalars(
+                select(KnowledgeBaseGrantModel)
+                .where(KnowledgeBaseGrantModel.knowledge_base_id == UUID(kb_id))
+                .order_by(KnowledgeBaseGrantModel.created_at.asc())
+            )
+        ).all()
+        user_ids = [grant.subject_id for grant in grants if grant.subject_type == "user"]
+        department_ids = [grant.subject_id for grant in grants if grant.subject_type == "department"]
+        users = {}
+        departments = {}
+        if user_ids:
+            users = {
+                item.id: item
+                for item in (
+                    await session.scalars(select(UserModel).where(UserModel.id.in_(user_ids)))
+                ).all()
+            }
+        if department_ids:
+            departments = {
+                item.id: item
+                for item in (
+                    await session.scalars(select(DepartmentModel).where(DepartmentModel.id.in_(department_ids)))
+                ).all()
+            }
+        return [_grant_to_dataclass(grant, users=users, departments=departments) for grant in grants]
+
+
+async def upsert_knowledge_base_grant(
+    settings: AppSettings,
+    *,
+    kb_id: str,
+    subject_type: str,
+    subject_id: str,
+    role: str,
+    granted_by_user_id: str,
+) -> tuple[KnowledgeBaseGrant, str | None]:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        kb = await session.get(KnowledgeBaseModel, UUID(kb_id))
+        if kb is None or kb.status == "deleted":
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=404, detail="Knowledge base not found")
+        if subject_type == "user":
+            subject = await session.get(UserModel, UUID(subject_id))
+            if subject is None or subject.org_id != kb.org_id or not subject.is_active:
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="Grant user not found")
+            if subject.id == kb.owner_user_id and role != "admin":
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=400, detail="Knowledge base owner must keep admin grant")
+        elif subject_type == "department":
+            subject = await session.get(DepartmentModel, UUID(subject_id))
+            if subject is None or subject.org_id != kb.org_id:
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="Grant department not found")
+        else:
+            raise ValueError("Unsupported grant subject type")
+        existing = await session.scalar(
+            select(KnowledgeBaseGrantModel).where(
+                KnowledgeBaseGrantModel.knowledge_base_id == UUID(kb_id),
+                KnowledgeBaseGrantModel.subject_type == subject_type,
+                KnowledgeBaseGrantModel.subject_id == UUID(subject_id),
+            )
+        )
+        old_role = existing.role if existing else None
+    stmt = insert(KnowledgeBaseGrantModel).values(
+        id=uuid4(),
+        knowledge_base_id=UUID(kb_id),
+        subject_type=subject_type,
+        subject_id=UUID(subject_id),
+        role=role,
+        granted_by_user_id=UUID(granted_by_user_id),
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[
+            KnowledgeBaseGrantModel.knowledge_base_id,
+            KnowledgeBaseGrantModel.subject_type,
+            KnowledgeBaseGrantModel.subject_id,
+        ],
+        set_={
+            "role": stmt.excluded.role,
+            "granted_by_user_id": stmt.excluded.granted_by_user_id,
+            "updated_at": func.now(),
+        },
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(stmt)
+            if subject_type == "user":
+                member_stmt = insert(KnowledgeBaseMemberModel).values(
+                    id=uuid4(),
+                    knowledge_base_id=UUID(kb_id),
+                    user_id=UUID(subject_id),
+                    role=role,
+                )
+                member_stmt = member_stmt.on_conflict_do_update(
+                    index_elements=[
+                        KnowledgeBaseMemberModel.knowledge_base_id,
+                        KnowledgeBaseMemberModel.user_id,
+                    ],
+                    set_={"role": member_stmt.excluded.role},
+                )
+                await session.execute(member_stmt)
+        grant = await session.scalar(
+            select(KnowledgeBaseGrantModel).where(
+                KnowledgeBaseGrantModel.knowledge_base_id == UUID(kb_id),
+                KnowledgeBaseGrantModel.subject_type == subject_type,
+                KnowledgeBaseGrantModel.subject_id == UUID(subject_id),
+            )
+        )
+        return (await _hydrate_grant(session, grant)), old_role
+
+
+async def remove_knowledge_base_grant(settings: AppSettings, *, kb_id: str, grant_id: str) -> KnowledgeBaseGrant:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            grant = await session.get(KnowledgeBaseGrantModel, UUID(grant_id))
+            if grant is None or grant.knowledge_base_id != UUID(kb_id):
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="Knowledge base grant not found")
+            kb = await session.get(KnowledgeBaseModel, UUID(kb_id))
+            if kb is not None and grant.subject_type == "user" and grant.subject_id == kb.owner_user_id:
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=400, detail="Knowledge base owner grant cannot be removed")
+            hydrated = await _hydrate_grant(session, grant)
+            await session.execute(delete(KnowledgeBaseGrantModel).where(KnowledgeBaseGrantModel.id == UUID(grant_id)))
+            if grant.subject_type == "user":
+                await session.execute(
+                    delete(KnowledgeBaseMemberModel).where(
+                        KnowledgeBaseMemberModel.knowledge_base_id == UUID(kb_id),
+                        KnowledgeBaseMemberModel.user_id == grant.subject_id,
+                    )
+                )
+            return hydrated
+
+
 async def is_knowledge_base_owner(settings: AppSettings, *, kb_id: str, user_id: str) -> bool:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
@@ -529,8 +700,6 @@ async def upsert_knowledge_base_member(
 
 
 async def remove_knowledge_base_member(settings: AppSettings, *, kb_id: str, user_id: str) -> None:
-    from sqlalchemy import delete
-
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
         async with session.begin():
@@ -543,6 +712,13 @@ async def remove_knowledge_base_member(settings: AppSettings, *, kb_id: str, use
                 delete(KnowledgeBaseMemberModel).where(
                     KnowledgeBaseMemberModel.knowledge_base_id == UUID(kb_id),
                     KnowledgeBaseMemberModel.user_id == UUID(user_id),
+                )
+            )
+            await session.execute(
+                delete(KnowledgeBaseGrantModel).where(
+                    KnowledgeBaseGrantModel.knowledge_base_id == UUID(kb_id),
+                    KnowledgeBaseGrantModel.subject_type == "user",
+                    KnowledgeBaseGrantModel.subject_id == UUID(user_id),
                 )
             )
 
@@ -837,14 +1013,7 @@ async def _kb_capabilities(session: Any, kb: KnowledgeBaseModel, user: Any) -> K
             can_manage_api_keys=True,
         )
     is_owner = str(kb.owner_user_id) == user.id
-    member = await session.scalar(
-        select(KnowledgeBaseMemberModel).where(
-            KnowledgeBaseMemberModel.knowledge_base_id == kb.id,
-            KnowledgeBaseMemberModel.user_id == UUID(user.id),
-        )
-    )
-    member_role = member.role if member is not None else None
-    if is_owner or member_role == "owner":
+    if is_owner:
         return KnowledgeBaseCapabilities(
             current_user_role="owner",
             can_read=True,
@@ -853,7 +1022,49 @@ async def _kb_capabilities(session: Any, kb: KnowledgeBaseModel, user: Any) -> K
             can_manage_settings=True,
             can_manage_api_keys=True,
         )
-    if member_role == "editor":
+    member = await session.scalar(
+        select(KnowledgeBaseMemberModel).where(
+            KnowledgeBaseMemberModel.knowledge_base_id == kb.id,
+            KnowledgeBaseMemberModel.user_id == UUID(user.id),
+        )
+    )
+    roles: list[str] = []
+    if member is not None:
+        roles.append("admin" if member.role in {"owner", "admin"} else member.role)
+    direct_grant = await session.scalar(
+        select(KnowledgeBaseGrantModel).where(
+            KnowledgeBaseGrantModel.knowledge_base_id == kb.id,
+            KnowledgeBaseGrantModel.subject_type == "user",
+            KnowledgeBaseGrantModel.subject_id == UUID(user.id),
+        )
+    )
+    if direct_grant is not None:
+        roles.append(direct_grant.role)
+    if kb.visibility == "org":
+        roles.append("viewer")
+    if user.department_id:
+        department_grant = await session.scalar(
+            select(KnowledgeBaseGrantModel).where(
+                KnowledgeBaseGrantModel.knowledge_base_id == kb.id,
+                KnowledgeBaseGrantModel.subject_type == "department",
+                KnowledgeBaseGrantModel.subject_id == UUID(user.department_id),
+            )
+        )
+        if department_grant is not None:
+            roles.append(department_grant.role)
+        if kb.visibility == "department" and user.department_id in list(kb.department_ids or []):
+            roles.append("viewer")
+    role = highest_kb_role(roles)
+    if role == "admin":
+        return KnowledgeBaseCapabilities(
+            current_user_role="admin",
+            can_read=True,
+            can_write=True,
+            can_manage_members=True,
+            can_manage_settings=True,
+            can_manage_api_keys=True,
+        )
+    if role == "editor":
         return KnowledgeBaseCapabilities(
             current_user_role="editor",
             can_read=True,
@@ -862,7 +1073,7 @@ async def _kb_capabilities(session: Any, kb: KnowledgeBaseModel, user: Any) -> K
             can_manage_settings=False,
             can_manage_api_keys=False,
         )
-    if member_role == "viewer":
+    if role == "viewer":
         return KnowledgeBaseCapabilities(
             current_user_role="viewer",
             can_read=True,
@@ -871,20 +1082,20 @@ async def _kb_capabilities(session: Any, kb: KnowledgeBaseModel, user: Any) -> K
             can_manage_settings=False,
             can_manage_api_keys=False,
         )
-    implicit_read = False
-    if member is None:
-        if kb.visibility == "org":
-            implicit_read = True
-        if kb.visibility == "department" and user.department_id and user.department_id in list(kb.department_ids or []):
-            implicit_read = True
     return KnowledgeBaseCapabilities(
-        current_user_role="implicit_viewer" if implicit_read else "none",
-        can_read=implicit_read,
+        current_user_role="none",
+        can_read=False,
         can_write=False,
         can_manage_members=False,
         can_manage_settings=False,
         can_manage_api_keys=False,
     )
+
+
+def highest_kb_role(roles: list[str]) -> str | None:
+    order = {"viewer": 1, "editor": 2, "admin": 3, "owner": 3}
+    normalized = ["admin" if role == "owner" else role for role in roles if role in order]
+    return max(normalized, key=lambda role: order[role], default=None)
 
 
 def _user_to_dataclass(model: UserModel) -> EnterpriseUser:
@@ -945,4 +1156,49 @@ def _member_to_dataclass(member: KnowledgeBaseMemberModel, user: UserModel) -> K
         display_name=user.display_name,
         department_id=str(user.department_id) if user.department_id else None,
         created_at=member.created_at,
+    )
+
+
+async def _hydrate_grant(session: Any, grant: KnowledgeBaseGrantModel) -> KnowledgeBaseGrant:
+    users: dict[UUID, UserModel] = {}
+    departments: dict[UUID, DepartmentModel] = {}
+    if grant.subject_type == "user":
+        user = await session.get(UserModel, grant.subject_id)
+        if user is not None:
+            users[user.id] = user
+    if grant.subject_type == "department":
+        department = await session.get(DepartmentModel, grant.subject_id)
+        if department is not None:
+            departments[department.id] = department
+    return _grant_to_dataclass(grant, users=users, departments=departments)
+
+
+def _grant_to_dataclass(
+    grant: KnowledgeBaseGrantModel,
+    *,
+    users: dict[UUID, UserModel],
+    departments: dict[UUID, DepartmentModel],
+) -> KnowledgeBaseGrant:
+    subject_name = None
+    subject_email = None
+    if grant.subject_type == "user":
+        user = users.get(grant.subject_id)
+        if user is not None:
+            subject_name = user.display_name
+            subject_email = user.email
+    if grant.subject_type == "department":
+        department = departments.get(grant.subject_id)
+        if department is not None:
+            subject_name = department.name
+    return KnowledgeBaseGrant(
+        id=str(grant.id),
+        knowledge_base_id=str(grant.knowledge_base_id),
+        subject_type=grant.subject_type,
+        subject_id=str(grant.subject_id),
+        subject_name=subject_name,
+        subject_email=subject_email,
+        role=grant.role,
+        granted_by_user_id=str(grant.granted_by_user_id) if grant.granted_by_user_id else None,
+        created_at=grant.created_at,
+        updated_at=grant.updated_at,
     )

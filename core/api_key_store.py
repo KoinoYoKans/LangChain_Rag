@@ -9,7 +9,14 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import select, update
 
-from config.database import ApiKeyModel, KnowledgeBaseMemberModel, KnowledgeBaseModel, UserModel, build_async_session_maker
+from config.database import (
+    ApiKeyModel,
+    KnowledgeBaseGrantModel,
+    KnowledgeBaseMemberModel,
+    KnowledgeBaseModel,
+    UserModel,
+    build_async_session_maker,
+)
 from config.settings import AppSettings
 
 
@@ -249,7 +256,29 @@ async def _api_key_user_can_manage_bound_kb(session: Any, knowledge_base: Knowle
             KnowledgeBaseMemberModel.role == "owner",
         )
     )
-    return member is not None
+    if member is not None:
+        return True
+    direct_grant = await session.scalar(
+        select(KnowledgeBaseGrantModel).where(
+            KnowledgeBaseGrantModel.knowledge_base_id == knowledge_base.id,
+            KnowledgeBaseGrantModel.subject_type == "user",
+            KnowledgeBaseGrantModel.subject_id == user.id,
+            KnowledgeBaseGrantModel.role == "admin",
+        )
+    )
+    if direct_grant is not None:
+        return True
+    if user.department_id is None:
+        return False
+    department_grant = await session.scalar(
+        select(KnowledgeBaseGrantModel).where(
+            KnowledgeBaseGrantModel.knowledge_base_id == knowledge_base.id,
+            KnowledgeBaseGrantModel.subject_type == "department",
+            KnowledgeBaseGrantModel.subject_id == user.department_id,
+            KnowledgeBaseGrantModel.role == "admin",
+        )
+    )
+    return department_grant is not None
 
 
 def _hash_key(secret: str) -> str:

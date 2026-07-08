@@ -111,6 +111,29 @@ class KnowledgeBaseMemberModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class KnowledgeBaseGrantModel(Base):
+    __tablename__ = os.getenv("KNOWLEDGE_BASE_GRANT_TABLE", "rag_knowledge_base_grants")
+    __table_args__ = (
+        CheckConstraint("subject_type in ('user', 'department')", name="rag_kb_grants_subject_type_check"),
+        CheckConstraint("role in ('viewer', 'editor', 'admin')", name="rag_kb_grants_role_check"),
+        Index("rag_kb_grants_subject_uidx", "knowledge_base_id", "subject_type", "subject_id", unique=True),
+        Index("rag_kb_grants_subject_idx", "subject_type", "subject_id"),
+    )
+
+    id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    knowledge_base_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    subject_type: Mapped[str] = mapped_column(String, nullable=False)
+    subject_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    role: Mapped[str] = mapped_column(String, nullable=False, default="viewer")
+    granted_by_user_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class IngestJobModel(Base):
     __tablename__ = os.getenv("INGEST_JOB_TABLE", "rag_ingest_jobs")
     __table_args__ = (
@@ -514,6 +537,52 @@ async def _migrate_existing_tables(connection: Any, settings: AppSettings) -> No
     }
     for column, column_type in api_key_columns.items():
         await connection.execute(text(f'alter table "{api_key_table}" add column if not exists {column} {column_type}'))
+
+    grant_table = os.getenv("KNOWLEDGE_BASE_GRANT_TABLE", "rag_knowledge_base_grants")
+    member_table = os.getenv("KNOWLEDGE_BASE_MEMBER_TABLE", "rag_knowledge_base_members")
+    await connection.execute(
+        text(
+            f'create table if not exists "{grant_table}" ('
+            "id uuid primary key, "
+            "knowledge_base_id uuid not null, "
+            "subject_type text not null, "
+            "subject_id uuid not null, "
+            "role text not null default 'viewer', "
+            "granted_by_user_id uuid, "
+            "created_at timestamp with time zone default now(), "
+            "updated_at timestamp with time zone default now(), "
+            "constraint rag_kb_grants_subject_type_check check (subject_type in ('user', 'department')), "
+            "constraint rag_kb_grants_role_check check (role in ('viewer', 'editor', 'admin'))"
+            ")"
+        )
+    )
+    await connection.execute(
+        text(
+            f'create unique index if not exists "rag_kb_grants_subject_uidx" '
+            f'on "{grant_table}" (knowledge_base_id, subject_type, subject_id)'
+        )
+    )
+    await connection.execute(
+        text(
+            f'create index if not exists "rag_kb_grants_subject_idx" '
+            f'on "{grant_table}" (subject_type, subject_id)'
+        )
+    )
+    await connection.execute(
+        text(
+            f'insert into "{grant_table}" (id, knowledge_base_id, subject_type, subject_id, role, granted_by_user_id, created_at, updated_at) '
+            "select (substr(md5(knowledge_base_id::text || ':user:' || user_id::text), 1, 8) || '-' || "
+            "substr(md5(knowledge_base_id::text || ':user:' || user_id::text), 9, 4) || '-' || "
+            "substr(md5(knowledge_base_id::text || ':user:' || user_id::text), 13, 4) || '-' || "
+            "substr(md5(knowledge_base_id::text || ':user:' || user_id::text), 17, 4) || '-' || "
+            "substr(md5(knowledge_base_id::text || ':user:' || user_id::text), 21, 12))::uuid, "
+            "knowledge_base_id, 'user', user_id, "
+            "case when role in ('owner', 'admin') then 'admin' when role = 'editor' then 'editor' else 'viewer' end, "
+            "null, created_at, now() "
+            f'from "{member_table}" '
+            "on conflict (knowledge_base_id, subject_type, subject_id) do nothing"
+        )
+    )
 
     await connection.execute(text(f'drop index if exists "{file_table}_content_sha256_uidx"'))
     await connection.execute(
