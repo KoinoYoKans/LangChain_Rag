@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -72,6 +72,11 @@ class AppSettings:
     embedding_batch_size: int
     postgres_dsn: str | None
     pgvector_table: str
+    rag_file_table: str
+    rag_chunk_table: str
+    rag_conversation_table: str
+    rag_message_table: str
+    chat_history_limit: int
     rag_top_k: int
     rerank_top_n: int
     chunk_size: int
@@ -113,6 +118,11 @@ class AppSettings:
             embedding_batch_size=_as_int("EMBEDDING_BATCH_SIZE", 16),
             postgres_dsn=_build_postgres_dsn(),
             pgvector_table=os.getenv("PGVECTOR_TABLE", "rag_documents"),
+            rag_file_table=os.getenv("RAG_FILE_TABLE", "rag_files"),
+            rag_chunk_table=os.getenv("RAG_CHUNK_TABLE", "rag_file_chunks"),
+            rag_conversation_table=os.getenv("RAG_CONVERSATION_TABLE", "rag_conversations"),
+            rag_message_table=os.getenv("RAG_MESSAGE_TABLE", "rag_messages"),
+            chat_history_limit=_as_int("CHAT_HISTORY_LIMIT", 10),
             rag_top_k=_as_int("RAG_TOP_K", 8),
             rerank_top_n=_as_int("RERANK_TOP_N", 4),
             chunk_size=_as_int("CHUNK_SIZE", 1000),
@@ -133,23 +143,20 @@ class AppSettings:
             errors.append("EMBEDDING_DIMENSION must be greater than 0")
         if self.rag_top_k <= 0:
             errors.append("RAG_TOP_K must be greater than 0")
+        if self.chat_history_limit < 0:
+            errors.append("CHAT_HISTORY_LIMIT must be greater than or equal to 0")
         if self.rerank_top_n < 0:
             errors.append("RERANK_TOP_N must be greater than or equal to 0")
         if self.chunk_size <= self.chunk_overlap:
             errors.append("CHUNK_SIZE must be greater than CHUNK_OVERLAP")
-        if self.embedding_provider not in {"local", "dashscope"}:
-            errors.append("EMBEDDING_PROVIDER must be either local or dashscope")
-        if self.embedding_provider == "local":
-            if not self.local_embedding_model_path:
-                errors.append("LOCAL_EMBEDDING_MODEL_PATH is required when EMBEDDING_PROVIDER=local")
-            elif not Path(self.local_embedding_model_path).exists():
-                errors.append(f"LOCAL_EMBEDDING_MODEL_PATH does not exist: {self.local_embedding_model_path}")
-        if self.embedding_provider == "dashscope" and not self.dashscope_api_key:
-            errors.append("DASHSCOPE_API_KEY is required when EMBEDDING_PROVIDER=dashscope")
-        if self.rerank_provider not in {"local", "dashscope"}:
-            errors.append("RERANK_PROVIDER must be either local or dashscope")
-        if self.rerank_top_n > 0 and self.rerank_provider == "dashscope" and not self.dashscope_api_key:
-            errors.append("DASHSCOPE_API_KEY is required when RERANK_PROVIDER=dashscope")
+        if self.embedding_provider != "local":
+            errors.append("EMBEDDING_PROVIDER must be local")
+        if not self.local_embedding_model_path:
+            errors.append("LOCAL_EMBEDDING_MODEL_PATH is required when EMBEDDING_PROVIDER=local")
+        elif not Path(self.local_embedding_model_path).exists():
+            errors.append(f"LOCAL_EMBEDDING_MODEL_PATH does not exist: {self.local_embedding_model_path}")
+        if self.rerank_provider != "local":
+            errors.append("RERANK_PROVIDER must be local")
         if self.rerank_top_n > 0 and self.rerank_provider == "local":
             if not self.local_rerank_model_path:
                 errors.append("LOCAL_RERANK_MODEL_PATH is required when RERANK_PROVIDER=local")
@@ -176,3 +183,32 @@ class AppSettings:
         if not self.postgres_dsn:
             raise ValueError("POSTGRES_DSN is required")
         return self.postgres_dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+
+    @property
+    def asyncpg_postgres_dsn(self) -> str:
+        if not self.postgres_dsn:
+            raise ValueError("POSTGRES_DSN is required")
+        dsn = self.postgres_dsn
+        if dsn.startswith("postgresql+psycopg://"):
+            dsn = dsn.replace("postgresql+psycopg://", "postgresql+asyncpg://", 1)
+        elif dsn.startswith("postgresql://"):
+            dsn = dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+        parsed = urlsplit(dsn)
+        query_items = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if key == "sslmode" and value in {"disable", "allow", "prefer"}:
+                continue
+            if key == "sslmode" and value in {"require", "verify-ca", "verify-full"}:
+                query_items.append(("ssl", "true"))
+                continue
+            query_items.append((key, value))
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                urlencode(query_items),
+                parsed.fragment,
+            )
+        )

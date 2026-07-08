@@ -17,7 +17,7 @@ class LocalSentenceTransformerEmbeddings(Embeddings):
         normalize_embeddings: bool = True,
         trust_remote_code: bool = True,
     ) -> None:
-        self.model_path = model_path2
+        self.model_path = model_path
         self.expected_dimension = expected_dimension
         self.batch_size = batch_size
         self.device = device
@@ -74,64 +74,9 @@ class LocalSentenceTransformerEmbeddings(Embeddings):
         return self._encode([text])[0]
 
 
-class DashScopeEmbeddings(Embeddings):
-    def __init__(
-        self,
-        api_key: str,
-        model: str,
-        expected_dimension: int,
-        batch_size: int = 16,
-    ) -> None:
-        self.api_key = api_key
-        self.model = model
-        self.expected_dimension = expected_dimension
-        self.batch_size = batch_size
-
-    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
-        import dashscope
-
-        response = dashscope.TextEmbedding.call(
-            api_key=self.api_key,
-            model=self.model,
-            input=texts,
-            dimension=self.expected_dimension,
-            output_type="dense",
-        )
-        status_code = getattr(response, "status_code", 200)
-        if status_code != 200:
-            message = getattr(response, "message", "DashScope embedding request failed")
-            raise RuntimeError(f"DashScope embedding failed: {message}")
-
-        output = getattr(response, "output", None) or response.get("output", {})
-        embeddings = output.get("embeddings", [])
-        vectors = [item["embedding"] for item in sorted(embeddings, key=lambda item: item.get("text_index", 0))]
-        if vectors and len(vectors[0]) != self.expected_dimension:
-            raise ValueError(
-                "Embedding dimension mismatch: "
-                f"expected EMBEDDING_DIMENSION={self.expected_dimension}, got {len(vectors[0])}"
-            )
-        return vectors
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        vectors: list[list[float]] = []
-        for index in range(0, len(texts), self.batch_size):
-            vectors.extend(self._embed_batch(texts[index : index + self.batch_size]))
-        return vectors
-
-    def embed_query(self, text: str) -> list[float]:
-        return self.embed_documents([text])[0]
-
-
 def build_embeddings(settings: AppSettings) -> Embeddings:
-    if settings.embedding_provider == "dashscope":
-        if not settings.dashscope_api_key:
-            raise ValueError("DASHSCOPE_API_KEY is required when EMBEDDING_PROVIDER=dashscope")
-        return DashScopeEmbeddings(
-            api_key=settings.dashscope_api_key,
-            model=settings.qwen_embedding_model,
-            expected_dimension=settings.embedding_dimension,
-            batch_size=settings.embedding_batch_size,
-        )
+    if settings.embedding_provider != "local":
+        raise ValueError("Only local embeddings are supported. Set EMBEDDING_PROVIDER=local")
     if not settings.local_embedding_model_path:
         raise ValueError("LOCAL_EMBEDDING_MODEL_PATH is required when EMBEDDING_PROVIDER=local")
     return LocalSentenceTransformerEmbeddings(
