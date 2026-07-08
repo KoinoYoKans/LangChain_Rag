@@ -244,6 +244,50 @@ class FeedbackModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class QualityIssueModel(Base):
+    __tablename__ = os.getenv("QUALITY_ISSUE_TABLE", "rag_quality_issues")
+    __table_args__ = (
+        CheckConstraint(
+            "issue_type in ('wrong_answer', 'missing_source', 'source_mismatch', 'outdated_content', 'permission_risk', 'other')",
+            name="rag_quality_issues_type_check",
+        ),
+        CheckConstraint("priority in ('low', 'medium', 'high', 'urgent')", name="rag_quality_issues_priority_check"),
+        CheckConstraint("status in ('open', 'in_progress', 'resolved', 'ignored')", name="rag_quality_issues_status_check"),
+        Index("rag_quality_issues_message_uidx", "knowledge_base_id", "assistant_message_id", unique=True),
+        Index("rag_quality_issues_org_status_idx", "org_id", "status", "created_at"),
+        Index("rag_quality_issues_kb_status_idx", "knowledge_base_id", "status", "created_at"),
+        Index("rag_quality_issues_assignee_idx", "assignee_user_id", "status"),
+    )
+
+    id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    org_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_base_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    chat_log_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    conversation_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    assistant_message_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    sources_snapshot: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    issue_type: Mapped[str] = mapped_column(String, nullable=False)
+    priority: Mapped[str] = mapped_column(String, nullable=False, default="medium")
+    status: Mapped[str] = mapped_column(String, nullable=False, default="open")
+    assignee_user_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    resolution_note: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    feedback_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    feedback_rating: Mapped[str | None] = mapped_column(String)
+    feedback_reason: Mapped[str | None] = mapped_column(Text)
+    feedback_comment: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class RagFileModel(Base):
     __tablename__ = os.getenv("RAG_FILE_TABLE", "rag_files")
     __table_args__ = (
@@ -583,6 +627,78 @@ async def _migrate_existing_tables(connection: Any, settings: AppSettings) -> No
             "on conflict (knowledge_base_id, subject_type, subject_id) do nothing"
         )
     )
+
+    quality_issue_table = os.getenv("QUALITY_ISSUE_TABLE", "rag_quality_issues")
+    await connection.execute(
+        text(
+            f'create table if not exists "{quality_issue_table}" ('
+            "id uuid primary key, "
+            "org_id uuid not null, "
+            "knowledge_base_id uuid not null, "
+            "chat_log_id uuid, "
+            "conversation_id uuid, "
+            "assistant_message_id uuid not null, "
+            "user_id uuid, "
+            "question text not null, "
+            "answer_snapshot text not null, "
+            "sources_snapshot jsonb not null default '[]'::jsonb, "
+            "issue_type text not null, "
+            "priority text not null default 'medium', "
+            "status text not null default 'open', "
+            "assignee_user_id uuid, "
+            "resolution_note text, "
+            "created_by_user_id uuid not null, "
+            "resolved_at timestamp with time zone, "
+            "feedback_id uuid, "
+            "feedback_rating text, "
+            "feedback_reason text, "
+            "feedback_comment text, "
+            "created_at timestamp with time zone default now(), "
+            "updated_at timestamp with time zone default now(), "
+            "constraint rag_quality_issues_type_check check (issue_type in ('wrong_answer', 'missing_source', 'source_mismatch', 'outdated_content', 'permission_risk', 'other')), "
+            "constraint rag_quality_issues_priority_check check (priority in ('low', 'medium', 'high', 'urgent')), "
+            "constraint rag_quality_issues_status_check check (status in ('open', 'in_progress', 'resolved', 'ignored'))"
+            ")"
+        )
+    )
+    quality_issue_columns = {
+        "org_id": "uuid",
+        "knowledge_base_id": "uuid",
+        "chat_log_id": "uuid",
+        "conversation_id": "uuid",
+        "assistant_message_id": "uuid",
+        "user_id": "uuid",
+        "question": "text",
+        "answer_snapshot": "text",
+        "sources_snapshot": "jsonb not null default '[]'::jsonb",
+        "issue_type": "text",
+        "priority": "text not null default 'medium'",
+        "status": "text not null default 'open'",
+        "assignee_user_id": "uuid",
+        "resolution_note": "text",
+        "created_by_user_id": "uuid",
+        "resolved_at": "timestamp with time zone",
+        "feedback_id": "uuid",
+        "feedback_rating": "text",
+        "feedback_reason": "text",
+        "feedback_comment": "text",
+        "created_at": "timestamp with time zone default now()",
+        "updated_at": "timestamp with time zone default now()",
+    }
+    for column, column_type in quality_issue_columns.items():
+        await connection.execute(text(f'alter table "{quality_issue_table}" add column if not exists {column} {column_type}'))
+    quality_issue_indexes = {
+        "rag_quality_issues_message_uidx": "(knowledge_base_id, assistant_message_id) unique",
+        "rag_quality_issues_org_status_idx": "(org_id, status, created_at)",
+        "rag_quality_issues_kb_status_idx": "(knowledge_base_id, status, created_at)",
+        "rag_quality_issues_assignee_idx": "(assignee_user_id, status)",
+    }
+    for index_name, index_columns in quality_issue_indexes.items():
+        unique = "unique " if index_columns.endswith(" unique") else ""
+        columns = index_columns.removesuffix(" unique")
+        await connection.execute(
+            text(f'create {unique}index if not exists "{index_name}" on "{quality_issue_table}" {columns}')
+        )
 
     await connection.execute(text(f'drop index if exists "{file_table}_content_sha256_uidx"'))
     await connection.execute(

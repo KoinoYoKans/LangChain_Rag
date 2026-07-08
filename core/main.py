@@ -124,6 +124,14 @@ from core.import_plan_store import (
     release_import_plan_lock,
     save_import_plan,
 )
+from core.quality_issue_store import (
+    QualityIssue,
+    create_quality_issue_from_chat,
+    get_quality_issue,
+    list_quality_issue_links,
+    list_quality_issues,
+    update_quality_issue,
+)
 from core.ingestion import _extract_title, _fetch_url, _slugify
 from core.job_queue import enqueue_ingest_job, get_ingest_queue_length, get_worker_heartbeat
 from core.rerank import RerankedDocument, Reranker, build_reranker
@@ -253,11 +261,63 @@ class ChatOperationResponse(BaseModel):
     feedback_rating: str | None = None
     feedback_reason: str | None = None
     feedback_comment: str | None = None
+    quality_issue_id: str | None = None
+    quality_issue_status: str | None = None
+    quality_issue_priority: str | None = None
+    quality_issue_type: str | None = None
+    quality_issue_assignee_user_id: str | None = None
     created_at: str
 
 
 class ChatOperationListResponse(BaseModel):
     items: list[ChatOperationResponse]
+
+
+class QualityIssueCreateRequest(BaseModel):
+    knowledge_base_id: str = Field(min_length=1)
+    assistant_message_id: str | None = None
+    chat_log_id: str | None = None
+    issue_type: str = Field(pattern="^(wrong_answer|missing_source|source_mismatch|outdated_content|permission_risk|other)$")
+    priority: str = Field(default="medium", pattern="^(low|medium|high|urgent)$")
+    assignee_user_id: str | None = None
+    resolution_note: str | None = Field(default=None, max_length=2000)
+
+
+class QualityIssueUpdateRequest(BaseModel):
+    status: str | None = Field(default=None, pattern="^(open|in_progress|resolved|ignored)$")
+    priority: str | None = Field(default=None, pattern="^(low|medium|high|urgent)$")
+    assignee_user_id: str | None = None
+    resolution_note: str | None = Field(default=None, max_length=4000)
+
+
+class QualityIssueResponse(BaseModel):
+    id: str
+    org_id: str
+    knowledge_base_id: str
+    chat_log_id: str | None
+    conversation_id: str | None
+    assistant_message_id: str
+    user_id: str | None
+    question: str
+    answer_snapshot: str
+    sources_snapshot: list[dict[str, Any]]
+    issue_type: str
+    priority: str
+    status: str
+    assignee_user_id: str | None
+    resolution_note: str | None
+    created_by_user_id: str
+    resolved_at: str | None
+    feedback_id: str | None
+    feedback_rating: str | None
+    feedback_reason: str | None
+    feedback_comment: str | None
+    created_at: str
+    updated_at: str
+
+
+class QualityIssueListResponse(BaseModel):
+    items: list[QualityIssueResponse]
 
 
 class DocumentUploadResponse(BaseModel):
@@ -3061,17 +3121,18 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> FeedbackListResponse:
         state = require_ready(app)
-        require_manager(current_user)
+        allowed_kb_ids = None
         if knowledge_base_id:
-            await require_kb_access_or_audit(
+            await require_kb_capability_or_audit(
                 state.settings,
                 request=http_request,
                 kb_id=knowledge_base_id,
                 user=current_user,
                 action="feedback.list.denied",
+                capability="settings",
             )
         elif not current_user.is_admin:
-            raise HTTPException(status_code=403, detail="Managers must filter feedback by knowledge_base_id")
+            allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
         return FeedbackListResponse(
             items=[
                 feedback_response(item)
@@ -3079,6 +3140,7 @@ def create_app() -> FastAPI:
                     state.settings,
                     org_id=current_user.org_id,
                     knowledge_base_id=knowledge_base_id,
+                    knowledge_base_ids=allowed_kb_ids,
                     limit=limit,
                     offset=offset,
                 )
@@ -3095,23 +3157,24 @@ def create_app() -> FastAPI:
         limit: int = Query(default=100, ge=1, le=500),
         current_user: CurrentUser = Depends(require_current_user),
     ) -> ChatOperationListResponse:
-        require_manager(current_user)
         state = get_state(app)
         allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
+        rows = await list_chat_operations(
+            state.settings,
+            org_id=current_user.org_id,
+            knowledge_base_ids=allowed_kb_ids,
+            limit=limit,
+            knowledge_base_id=knowledge_base_id,
+            feedback_rating=feedback_rating,
+            answer_status=answer_status,
+            low_confidence=low_confidence,
+            no_citations=no_citations,
+        )
+        rows = await attach_quality_issue_links(state.settings, current_user.org_id, allowed_kb_ids, rows)
         return ChatOperationListResponse(
             items=[
                 ChatOperationResponse(**item)
-                for item in await list_chat_operations(
-                    state.settings,
-                    org_id=current_user.org_id,
-                    knowledge_base_ids=allowed_kb_ids,
-                    limit=limit,
-                    knowledge_base_id=knowledge_base_id,
-                    feedback_rating=feedback_rating,
-                    answer_status=answer_status,
-                    low_confidence=low_confidence,
-                    no_citations=no_citations,
-                )
+                for item in rows
             ]
         )
 
@@ -3124,7 +3187,6 @@ def create_app() -> FastAPI:
         no_citations: bool = Query(default=False),
         current_user: CurrentUser = Depends(require_current_user),
     ) -> Response:
-        require_manager(current_user)
         state = get_state(app)
         allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
         rows = await list_chat_operations(
@@ -3138,6 +3200,7 @@ def create_app() -> FastAPI:
             low_confidence=low_confidence,
             no_citations=no_citations,
         )
+        rows = await attach_quality_issue_links(state.settings, current_user.org_id, allowed_kb_ids, rows)
         buffer = io.StringIO()
         writer = csv.DictWriter(
             buffer,
@@ -3154,6 +3217,9 @@ def create_app() -> FastAPI:
                 "retry_count",
                 "auto_retry_triggered",
                 "final_low_confidence",
+                "quality_issue_status",
+                "quality_issue_priority",
+                "quality_issue_type",
                 "latency_ms",
                 "total_tokens",
                 "request_id",
@@ -3167,6 +3233,215 @@ def create_app() -> FastAPI:
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="chat-operations.csv"'},
         )
+
+    @app.post("/quality-issues", response_model=QualityIssueResponse)
+    async def create_quality_issue_endpoint(
+        http_request: Request,
+        request: QualityIssueCreateRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> QualityIssueResponse:
+        state = get_state(app)
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=request.knowledge_base_id,
+            user=current_user,
+            action="quality_issue.create.denied",
+            capability="settings",
+            metadata={"assistant_message_id": request.assistant_message_id, "chat_log_id": request.chat_log_id},
+        )
+        if not request.assistant_message_id and not request.chat_log_id:
+            raise HTTPException(status_code=422, detail="assistant_message_id or chat_log_id is required")
+        await require_quality_issue_assignee(
+            state.settings,
+            org_id=current_user.org_id,
+            kb_id=request.knowledge_base_id,
+            assignee_user_id=request.assignee_user_id,
+        )
+        try:
+            issue, created = await create_quality_issue_from_chat(
+                state.settings,
+                org_id=current_user.org_id,
+                knowledge_base_id=request.knowledge_base_id,
+                created_by_user_id=current_user.id,
+                assistant_message_id=request.assistant_message_id,
+                chat_log_id=request.chat_log_id,
+                issue_type=request.issue_type,
+                priority=request.priority,
+                assignee_user_id=request.assignee_user_id,
+                resolution_note=request.resolution_note,
+            )
+        except ValueError as exc:
+            raise quality_issue_value_error(exc) from exc
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="quality_issue.create",
+            target_type="quality_issue",
+            target_id=issue.id,
+            metadata={
+                "knowledge_base_id": issue.knowledge_base_id,
+                "quality_issue_id": issue.id,
+                "assignee_user_id": issue.assignee_user_id,
+                "status": issue.status,
+                "issue_type": issue.issue_type,
+                "created": created,
+            },
+            **audit_context(http_request),
+        )
+        return quality_issue_response(issue)
+
+    @app.get("/quality-issues", response_model=QualityIssueListResponse)
+    async def quality_issue_list_endpoint(
+        knowledge_base_id: str | None = Query(default=None),
+        status: str | None = Query(default=None, pattern="^(open|in_progress|resolved|ignored)$"),
+        assignee_user_id: str | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> QualityIssueListResponse:
+        state = get_state(app)
+        allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
+        try:
+            issues = await list_quality_issues(
+                state.settings,
+                org_id=current_user.org_id,
+                knowledge_base_ids=allowed_kb_ids,
+                knowledge_base_id=knowledge_base_id,
+                status=status,
+                assignee_user_id=assignee_user_id,
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            raise quality_issue_value_error(exc) from exc
+        return QualityIssueListResponse(
+            items=[
+                quality_issue_response(item)
+                for item in issues
+            ]
+        )
+
+    @app.get("/quality-issue-assignees")
+    async def quality_issue_assignees_endpoint(
+        http_request: Request,
+        knowledge_base_id: str = Query(..., min_length=1),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, list[UserResponse]]:
+        state = get_state(app)
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="quality_issue.assignees.denied",
+            capability="settings",
+        )
+        return {
+            "items": [
+                user_response(item)
+                for item in await list_quality_issue_assignees(
+                    state.settings,
+                    org_id=current_user.org_id,
+                    kb_id=knowledge_base_id,
+                )
+            ]
+        }
+
+    @app.get("/quality-issues/{issue_id}", response_model=QualityIssueResponse)
+    async def quality_issue_detail_endpoint(
+        http_request: Request,
+        issue_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> QualityIssueResponse:
+        state = get_state(app)
+        try:
+            issue = await get_quality_issue(state.settings, issue_id)
+        except ValueError as exc:
+            raise quality_issue_value_error(exc) from exc
+        if issue is None:
+            raise HTTPException(status_code=404, detail="Quality issue not found")
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=issue.knowledge_base_id,
+            user=current_user,
+            action="quality_issue.detail.denied",
+            capability="settings",
+            metadata={"quality_issue_id": issue.id},
+        )
+        return quality_issue_response(issue)
+
+    @app.patch("/quality-issues/{issue_id}", response_model=QualityIssueResponse)
+    async def update_quality_issue_endpoint(
+        http_request: Request,
+        issue_id: str,
+        request: QualityIssueUpdateRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> QualityIssueResponse:
+        state = get_state(app)
+        try:
+            existing = await get_quality_issue(state.settings, issue_id)
+        except ValueError as exc:
+            raise quality_issue_value_error(exc) from exc
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Quality issue not found")
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=existing.knowledge_base_id,
+            user=current_user,
+            action="quality_issue.update.denied",
+            capability="settings",
+            metadata={"quality_issue_id": existing.id},
+        )
+        update_values = request.model_dump(exclude_unset=True)
+        if not update_values:
+            raise HTTPException(status_code=422, detail="No quality issue fields to update")
+        await require_quality_issue_assignee(
+            state.settings,
+            org_id=current_user.org_id,
+            kb_id=existing.knowledge_base_id,
+            assignee_user_id=update_values.get("assignee_user_id"),
+        )
+        try:
+            issue, before = await update_quality_issue(
+                state.settings,
+                issue_id=issue_id,
+                org_id=current_user.org_id,
+                values=update_values,
+            )
+        except ValueError as exc:
+            raise quality_issue_value_error(exc) from exc
+        action = (
+            "quality_issue.resolve"
+            if issue.status == "resolved" and before["status"] != "resolved"
+            else "quality_issue.ignore"
+            if issue.status == "ignored" and before["status"] != "ignored"
+            else "quality_issue.update"
+        )
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action=action,
+            target_type="quality_issue",
+            target_id=issue.id,
+            metadata={
+                "knowledge_base_id": issue.knowledge_base_id,
+                "quality_issue_id": issue.id,
+                "assignee_user_id": issue.assignee_user_id,
+                "status": issue.status,
+                "issue_type": issue.issue_type,
+                "old_status": before["status"],
+                "old_priority": before["priority"],
+            },
+            **audit_context(http_request),
+        )
+        return quality_issue_response(issue)
 
     @app.post("/v1/knowledge/{knowledge_base_id}/retrieval", response_model=RetrievalResponse)
     async def open_retrieval(
@@ -3946,6 +4221,34 @@ def feedback_response(feedback: Feedback) -> FeedbackResponse:
     )
 
 
+def quality_issue_response(issue: QualityIssue) -> QualityIssueResponse:
+    return QualityIssueResponse(
+        id=issue.id,
+        org_id=issue.org_id,
+        knowledge_base_id=issue.knowledge_base_id,
+        chat_log_id=issue.chat_log_id,
+        conversation_id=issue.conversation_id,
+        assistant_message_id=issue.assistant_message_id,
+        user_id=issue.user_id,
+        question=issue.question,
+        answer_snapshot=issue.answer_snapshot,
+        sources_snapshot=issue.sources_snapshot,
+        issue_type=issue.issue_type,
+        priority=issue.priority,
+        status=issue.status,
+        assignee_user_id=issue.assignee_user_id,
+        resolution_note=issue.resolution_note,
+        created_by_user_id=issue.created_by_user_id,
+        resolved_at=issue.resolved_at.isoformat() if issue.resolved_at else None,
+        feedback_id=issue.feedback_id,
+        feedback_rating=issue.feedback_rating,
+        feedback_reason=issue.feedback_reason,
+        feedback_comment=issue.feedback_comment,
+        created_at=issue.created_at.isoformat(),
+        updated_at=issue.updated_at.isoformat(),
+    )
+
+
 def file_record_response(file_record: RagFile) -> FileRecordResponse:
     return FileRecordResponse(
         id=file_record.id,
@@ -4480,6 +4783,55 @@ async def revoke_api_keys_for_grant_subject_without_admin(
     return revoked
 
 
+async def attach_quality_issue_links(
+    settings: AppSettings,
+    org_id: str,
+    knowledge_base_ids: list[str],
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    assistant_message_ids = [
+        item["assistant_message_id"]
+        for item in rows
+        if item.get("assistant_message_id")
+    ]
+    links = await list_quality_issue_links(
+        settings,
+        org_id=org_id,
+        knowledge_base_ids=knowledge_base_ids,
+        assistant_message_ids=assistant_message_ids,
+    )
+    for item in rows:
+        issue = links.get(str(item.get("assistant_message_id")))
+        if issue is None:
+            item.update(
+                {
+                    "quality_issue_id": None,
+                    "quality_issue_status": None,
+                    "quality_issue_priority": None,
+                    "quality_issue_type": None,
+                    "quality_issue_assignee_user_id": None,
+                }
+            )
+            continue
+        item.update(
+            {
+                "quality_issue_id": issue.id,
+                "quality_issue_status": issue.status,
+                "quality_issue_priority": issue.priority,
+                "quality_issue_type": issue.issue_type,
+                "quality_issue_assignee_user_id": issue.assignee_user_id,
+            }
+        )
+    return rows
+
+
+def quality_issue_value_error(error: ValueError) -> HTTPException:
+    detail = str(error)
+    if "not found" in detail.lower():
+        return HTTPException(status_code=404, detail=detail)
+    return HTTPException(status_code=422, detail=detail)
+
+
 async def audit_access_denied(
     settings: AppSettings,
     *,
@@ -4601,6 +4953,45 @@ async def manageable_knowledge_base_ids(settings: AppSettings, user: CurrentUser
         for kb in await list_knowledge_bases(settings, user)
         if (await get_knowledge_base_capabilities(settings, kb.id, user)).can_manage_settings
     ]
+
+
+async def list_quality_issue_assignees(settings: AppSettings, *, org_id: str, kb_id: str) -> list[Any]:
+    candidates = []
+    for user in await list_users(settings, org_id):
+        if not user.is_active:
+            continue
+        capabilities = await get_knowledge_base_capabilities(settings, kb_id, current_user_from_enterprise_user(user))
+        if capabilities.can_manage_settings:
+            candidates.append(user)
+    return candidates
+
+
+async def require_quality_issue_assignee(
+    settings: AppSettings,
+    *,
+    org_id: str,
+    kb_id: str,
+    assignee_user_id: str | None,
+) -> None:
+    if not assignee_user_id:
+        return
+    assignee = await get_user_by_id(settings, assignee_user_id)
+    if assignee is None or assignee.org_id != org_id or not assignee.is_active:
+        raise HTTPException(status_code=422, detail="Assignee user not found")
+    capabilities = await get_knowledge_base_capabilities(settings, kb_id, current_user_from_enterprise_user(assignee))
+    if not capabilities.can_manage_settings:
+        raise HTTPException(status_code=422, detail="Assignee must be able to manage this knowledge base")
+
+
+def current_user_from_enterprise_user(user: Any) -> CurrentUser:
+    return CurrentUser(
+        id=user.id,
+        org_id=user.org_id,
+        department_id=user.department_id,
+        email=user.email,
+        display_name=user.display_name,
+        role=user.role,
+    )
 
 
 def csv_safe(value: Any) -> Any:

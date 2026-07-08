@@ -125,7 +125,7 @@ function Shell() {
         {page === "chat" && <ChatWorkspace api={api} />}
         {page === "users" && <UsersWorkspace api={api} user={user} />}
         {page === "api" && <ApiKeyWorkspace api={api} />}
-        {page === "audit" && <AuditWorkspace api={api} />}
+        {page === "audit" && <AuditWorkspace api={api} user={user} />}
       </Layout.Content>
     </Layout>
   );
@@ -1394,16 +1394,33 @@ function ApiKeyWorkspace({ api }) {
   );
 }
 
-function AuditWorkspace({ api }) {
+function AuditWorkspace({ api, user }) {
+  const queryClient = useQueryClient();
   const [chatFilters, setChatFilters] = useState({ feedback_rating: "", answer_status: "", knowledge_base_id: "", low_confidence: false, no_citations: false });
+  const [qualityFilters, setQualityFilters] = useState({ knowledge_base_id: "", status: "", assignee_user_id: "" });
   const [chatOperation, setChatOperation] = useState(null);
+  const [issueDraft, setIssueDraft] = useState(null);
+  const [qualityIssue, setQualityIssue] = useState(null);
+  const [issueForm] = Form.useForm();
+  const [issueUpdateForm] = Form.useForm();
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
-  const logs = useQuery({ queryKey: ["audit"], refetchInterval: 5000, queryFn: async () => (await api.get("/audit-logs")).data.items || [] });
+  const logs = useQuery({ queryKey: ["audit"], enabled: user?.role !== "member", refetchInterval: 5000, queryFn: async () => (await api.get("/audit-logs")).data.items || [] });
   const feedback = useQuery({ queryKey: ["feedback"], refetchInterval: 10000, queryFn: async () => (await api.get("/feedback")).data.items || [] });
   const chatOperations = useQuery({
     queryKey: ["chat-operations", chatFilters],
     refetchInterval: 10000,
     queryFn: async () => (await api.get("/chat-operations", { params: compactParams(chatFilters) })).data.items || [],
+  });
+  const qualityIssues = useQuery({
+    queryKey: ["quality-issues", qualityFilters],
+    refetchInterval: 10000,
+    queryFn: async () => (await api.get("/quality-issues", { params: compactParams(qualityFilters) })).data.items || [],
+  });
+  const assigneeKnowledgeBaseId = issueDraft?.knowledge_base_id || qualityIssue?.knowledge_base_id || qualityFilters.knowledge_base_id || "";
+  const qualityIssueAssignees = useQuery({
+    queryKey: ["quality-issue-assignees", assigneeKnowledgeBaseId],
+    enabled: Boolean(assigneeKnowledgeBaseId),
+    queryFn: async () => (await api.get("/quality-issue-assignees", { params: { knowledge_base_id: assigneeKnowledgeBaseId } })).data.items || [],
   });
   const chatOpsStats = useMemo(() => {
     const rows = chatOperations.data || [];
@@ -1430,9 +1447,61 @@ function AuditWorkspace({ api }) {
     },
     onError: (error) => message.error(readError(error)),
   });
+  const createQualityIssueMutation = useMutation({
+    mutationFn: (values) => api.post("/quality-issues", values),
+    onSuccess: () => {
+      setIssueDraft(null);
+      issueForm.resetFields();
+      queryClient.invalidateQueries({ queryKey: ["chat-operations"] });
+      queryClient.invalidateQueries({ queryKey: ["quality-issues"] });
+      message.success("质量待办已创建");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const updateQualityIssueMutation = useMutation({
+    mutationFn: ({ id, values }) => api.patch(`/quality-issues/${id}`, values),
+    onSuccess: ({ data }) => {
+      setQualityIssue(data);
+      queryClient.invalidateQueries({ queryKey: ["chat-operations"] });
+      queryClient.invalidateQueries({ queryKey: ["quality-issues"] });
+      message.success("质量待办已更新");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
   function updateChatFilter(key, value) {
     setChatFilters((filters) => ({ ...filters, [key]: value }));
   }
+  function updateQualityFilter(key, value) {
+    setQualityFilters((filters) => ({ ...filters, [key]: value }));
+  }
+  function openQualityIssueModal(row) {
+    setIssueDraft(row);
+    issueForm.setFieldsValue({
+      knowledge_base_id: row.knowledge_base_id,
+      assistant_message_id: row.assistant_message_id,
+      issue_type: defaultIssueType(row),
+      priority: row.final_low_confidence || row.feedback_rating === "down" ? "high" : "medium",
+      assignee_user_id: undefined,
+      resolution_note: row.feedback_comment || "",
+    });
+  }
+  function submitQualityIssue() {
+    issueForm.validateFields().then((values) => createQualityIssueMutation.mutate(values));
+  }
+  function openQualityIssue(row) {
+    setQualityIssue(row);
+    issueUpdateForm.setFieldsValue({
+      status: row.status,
+      priority: row.priority,
+      assignee_user_id: row.assignee_user_id || undefined,
+      resolution_note: row.resolution_note || "",
+    });
+  }
+  function submitQualityIssueUpdate() {
+    if (!qualityIssue) return;
+    issueUpdateForm.validateFields().then((values) => updateQualityIssueMutation.mutate({ id: qualityIssue.id, values }));
+  }
+  const assigneeOptions = (qualityIssueAssignees.data || []).filter((item) => item.is_active).map((item) => ({ value: item.id, label: `${item.display_name} · ${item.email}` }));
   return (
     <section className="surface full">
       <PageTitle title="审计与反馈" subtitle="记录用户操作、请求上下文和回答质量反馈。" />
@@ -1502,6 +1571,15 @@ function AuditWorkspace({ api }) {
                     { title: "重试", dataIndex: "retry_count", width: 90, render: (value, row) => value ? <Tag color={row.final_low_confidence ? "red" : "blue"}>{value}</Tag> : "-" },
                     { title: "耗时", dataIndex: "latency_ms", width: 100, render: (value) => value == null ? "-" : `${value}ms` },
                     { title: "估算Tokens", dataIndex: "total_tokens", width: 110, render: (value) => value ?? "-" },
+                    {
+                      title: "质量待办",
+                      width: 130,
+                      render: (_, row) => row.quality_issue_id
+                        ? <Tag color={qualityIssueStatusColor(row.quality_issue_status)}>{qualityIssueStatusText(row.quality_issue_status)}</Tag>
+                        : isQualityIssueCandidate(row)
+                        ? <Button size="small" onClick={() => openQualityIssueModal(row)}>创建待办</Button>
+                        : "-",
+                    },
                     { title: "时间", dataIndex: "created_at", width: 180, render: formatTime },
                     { title: "详情", width: 80, render: (_, row) => <Button size="small" onClick={() => setChatOperation(row)}>查看</Button> },
                   ]}
@@ -1509,6 +1587,59 @@ function AuditWorkspace({ api }) {
                 <Drawer width="72vw" title="问答详情" open={Boolean(chatOperation)} onClose={() => setChatOperation(null)}>
                   {chatOperation && <ChatOperationDetail row={chatOperation} />}
                 </Drawer>
+              </>
+            ),
+          },
+          {
+            key: "quality",
+            label: "质量待办",
+            children: (
+              <>
+                <Space className="table-tools" wrap>
+                  <Select
+                    allowClear
+                    placeholder="知识库"
+                    value={qualityFilters.knowledge_base_id || undefined}
+                    style={{ width: 220 }}
+                    onChange={(value) => updateQualityFilter("knowledge_base_id", value || "")}
+                    options={(kbs.data || []).filter((item) => item.can_manage_settings).map((item) => ({ value: item.id, label: item.name }))}
+                  />
+                  <Select
+                    allowClear
+                    placeholder="状态"
+                    value={qualityFilters.status || undefined}
+                    style={{ width: 150 }}
+                    onChange={(value) => updateQualityFilter("status", value || "")}
+                    options={qualityIssueStatusOptions()}
+                  />
+                  <Select
+                    allowClear
+                    showSearch
+                    placeholder="负责人"
+                    disabled={!qualityFilters.knowledge_base_id}
+                    value={qualityFilters.assignee_user_id || undefined}
+                    style={{ width: 260 }}
+                    optionFilterProp="label"
+                    onChange={(value) => updateQualityFilter("assignee_user_id", value || "")}
+                    options={assigneeOptions}
+                  />
+                </Space>
+                <Table
+                  rowKey="id"
+                  loading={qualityIssues.isLoading}
+                  dataSource={qualityIssues.data || []}
+                  expandable={{ expandedRowRender: (row) => <QualityIssueDetail row={row} /> }}
+                  columns={[
+                    { title: "问题", dataIndex: "question", ellipsis: true },
+                    { title: "类型", dataIndex: "issue_type", width: 130, render: qualityIssueTypeText },
+                    { title: "优先级", dataIndex: "priority", width: 100, render: (value) => <Tag color={qualityIssuePriorityColor(value)}>{qualityIssuePriorityText(value)}</Tag> },
+                    { title: "状态", dataIndex: "status", width: 120, render: (value) => <Tag color={qualityIssueStatusColor(value)}>{qualityIssueStatusText(value)}</Tag> },
+                    { title: "负责人", dataIndex: "assignee_user_id", width: 110, render: (value) => value?.slice(0, 8) || "-" },
+                    { title: "反馈", dataIndex: "feedback_rating", width: 90, render: (value) => value ? <Tag color={value === "down" ? "red" : "green"}>{value === "down" ? "踩" : "赞"}</Tag> : "-" },
+                    { title: "时间", dataIndex: "created_at", width: 180, render: formatTime },
+                    { title: "操作", width: 90, render: (_, row) => <Button size="small" onClick={() => openQualityIssue(row)}>处理</Button> },
+                  ]}
+                />
               </>
             ),
           },
@@ -1557,6 +1688,63 @@ function AuditWorkspace({ api }) {
           },
         ]}
       />
+      <Modal
+        title="创建质量待办"
+        open={Boolean(issueDraft)}
+        onOk={submitQualityIssue}
+        confirmLoading={createQualityIssueMutation.isPending}
+        onCancel={() => setIssueDraft(null)}
+        width={760}
+      >
+        {issueDraft && (
+          <Space direction="vertical" className="full-select">
+            <Descriptions bordered column={1} size="small" items={[
+              { key: "question", label: "问题", children: issueDraft.question },
+              { key: "answer", label: "回答", children: <Typography.Paragraph ellipsis={{ rows: 4, expandable: true }}>{issueDraft.answer}</Typography.Paragraph> },
+              { key: "feedback", label: "反馈", children: `${issueDraft.feedback_reason || "-"} ${issueDraft.feedback_comment || ""}` },
+              { key: "sources", label: "引用", children: `${issueDraft.citation_count || 0}/${issueDraft.source_count || 0}` },
+            ]} />
+            <Form form={issueForm} layout="vertical">
+              <Form.Item name="knowledge_base_id" hidden><Input /></Form.Item>
+              <Form.Item name="assistant_message_id" hidden><Input /></Form.Item>
+              <Form.Item name="issue_type" label="问题类型" rules={[{ required: true }]}>
+                <Select options={qualityIssueTypeOptions()} />
+              </Form.Item>
+              <Form.Item name="priority" label="优先级" rules={[{ required: true }]}>
+                <Select options={qualityIssuePriorityOptions()} />
+              </Form.Item>
+              <Form.Item name="assignee_user_id" label="负责人">
+                <Select allowClear showSearch optionFilterProp="label" loading={qualityIssueAssignees.isLoading} options={assigneeOptions} />
+              </Form.Item>
+              <Form.Item name="resolution_note" label="备注">
+                <Input.TextArea rows={3} maxLength={2000} />
+              </Form.Item>
+            </Form>
+          </Space>
+        )}
+      </Modal>
+      <Drawer width="72vw" title="处理质量待办" open={Boolean(qualityIssue)} onClose={() => setQualityIssue(null)}>
+        {qualityIssue && (
+          <Space direction="vertical" className="full-select">
+            <QualityIssueDetail row={qualityIssue} />
+            <Form form={issueUpdateForm} layout="vertical">
+              <Form.Item name="status" label="状态" rules={[{ required: true }]}>
+                <Select options={qualityIssueStatusOptions()} />
+              </Form.Item>
+              <Form.Item name="priority" label="优先级" rules={[{ required: true }]}>
+                <Select options={qualityIssuePriorityOptions()} />
+              </Form.Item>
+              <Form.Item name="assignee_user_id" label="负责人">
+                <Select allowClear showSearch optionFilterProp="label" loading={qualityIssueAssignees.isLoading} options={assigneeOptions} />
+              </Form.Item>
+              <Form.Item name="resolution_note" label="处理说明">
+                <Input.TextArea rows={4} maxLength={4000} />
+              </Form.Item>
+              <Button type="primary" onClick={submitQualityIssueUpdate} loading={updateQualityIssueMutation.isPending}>保存处理结果</Button>
+            </Form>
+          </Space>
+        )}
+      </Drawer>
     </section>
   );
 }
@@ -1637,6 +1825,59 @@ function ChatOperationDetail({ row }) {
           <Typography.Paragraph>{row.feedback_reason || "-"}：{row.feedback_comment}</Typography.Paragraph>
         </>
       )}
+    </Space>
+  );
+}
+
+function QualityIssueDetail({ row }) {
+  return (
+    <Space direction="vertical" size={16} className="full-select">
+      <Descriptions
+        bordered
+        column={2}
+        size="small"
+        items={[
+          { key: "id", label: "待办 ID", children: row.id },
+          { key: "kb", label: "知识库", children: row.knowledge_base_id },
+          { key: "type", label: "类型", children: qualityIssueTypeText(row.issue_type) },
+          { key: "priority", label: "优先级", children: qualityIssuePriorityText(row.priority) },
+          { key: "status", label: "状态", children: qualityIssueStatusText(row.status) },
+          { key: "assignee", label: "负责人", children: row.assignee_user_id || "-" },
+          { key: "feedback", label: "反馈", children: `${row.feedback_rating || "-"} / ${row.feedback_reason || "-"}` },
+          { key: "resolved", label: "完成时间", children: formatTime(row.resolved_at) },
+        ]}
+      />
+      <Typography.Title level={5}>问题</Typography.Title>
+      <Typography.Paragraph>{row.question}</Typography.Paragraph>
+      <Typography.Title level={5}>回答快照</Typography.Title>
+      <Typography.Paragraph className="answer-content">{row.answer_snapshot}</Typography.Paragraph>
+      {row.feedback_comment && (
+        <>
+          <Typography.Title level={5}>反馈说明</Typography.Title>
+          <Typography.Paragraph>{row.feedback_comment}</Typography.Paragraph>
+        </>
+      )}
+      {row.resolution_note && (
+        <>
+          <Typography.Title level={5}>处理说明</Typography.Title>
+          <Typography.Paragraph>{row.resolution_note}</Typography.Paragraph>
+        </>
+      )}
+      <Typography.Title level={5}>引用快照</Typography.Title>
+      <Table
+        rowKey={(source, index) => `${source.chunk_id || source.source_index}-${index}`}
+        size="small"
+        pagination={false}
+        dataSource={row.sources_snapshot || []}
+        columns={[
+          { title: "引用", dataIndex: "source_index", width: 70, render: (value) => `[${value || "-"}]` },
+          { title: "文件", dataIndex: "filename" },
+          { title: "分块", dataIndex: "chunk_index", width: 80 },
+          { title: "页码", dataIndex: "page_number", width: 80, render: (value) => value || "-" },
+          { title: "分数", width: 120, render: (_, source) => scoreText(source.rerank_score ?? source.hybrid_score ?? source.vector_score) },
+          { title: "片段", dataIndex: "snippet" },
+        ]}
+      />
     </Space>
   );
 }
@@ -1772,6 +2013,78 @@ function answerStatusText(value) {
     unknown: "未知/历史",
   };
   return labels[value] || value || "未知/历史";
+}
+
+function isQualityIssueCandidate(row) {
+  return Boolean(
+    row?.assistant_message_id
+    && (
+      row.feedback_rating === "down"
+      || row.final_low_confidence
+      || row.confidence === "low"
+      || (row.citation_count || 0) === 0
+      || (row.source_count || 0) === 0
+      || ["no_sources", "citation_missing", "citation_invalid", "citation_incomplete"].includes(row.answer_status)
+    )
+  );
+}
+
+function defaultIssueType(row) {
+  if (row.feedback_reason === "permission_leak") return "permission_risk";
+  if (row.feedback_reason === "content_outdated") return "outdated_content";
+  if (row.feedback_reason === "source_mismatch") return "source_mismatch";
+  if (row.feedback_reason === "source_missing" || row.answer_status === "citation_missing" || row.answer_status === "no_sources") return "missing_source";
+  if (row.feedback_reason === "answer_wrong" || row.feedback_rating === "down") return "wrong_answer";
+  return "other";
+}
+
+function qualityIssueTypeOptions() {
+  return [
+    { value: "wrong_answer", label: "答案错误" },
+    { value: "missing_source", label: "缺少来源" },
+    { value: "source_mismatch", label: "引用不匹配" },
+    { value: "outdated_content", label: "内容过时" },
+    { value: "permission_risk", label: "权限风险" },
+    { value: "other", label: "其他" },
+  ];
+}
+
+function qualityIssueTypeText(value) {
+  return qualityIssueTypeOptions().find((item) => item.value === value)?.label || value || "-";
+}
+
+function qualityIssuePriorityOptions() {
+  return [
+    { value: "low", label: "低" },
+    { value: "medium", label: "中" },
+    { value: "high", label: "高" },
+    { value: "urgent", label: "紧急" },
+  ];
+}
+
+function qualityIssuePriorityText(value) {
+  return qualityIssuePriorityOptions().find((item) => item.value === value)?.label || value || "-";
+}
+
+function qualityIssuePriorityColor(value) {
+  return { low: "default", medium: "blue", high: "orange", urgent: "red" }[value] || "default";
+}
+
+function qualityIssueStatusOptions() {
+  return [
+    { value: "open", label: "待处理" },
+    { value: "in_progress", label: "处理中" },
+    { value: "resolved", label: "已解决" },
+    { value: "ignored", label: "已忽略" },
+  ];
+}
+
+function qualityIssueStatusText(value) {
+  return qualityIssueStatusOptions().find((item) => item.value === value)?.label || value || "-";
+}
+
+function qualityIssueStatusColor(value) {
+  return { open: "red", in_progress: "blue", resolved: "green", ignored: "default" }[value] || "default";
 }
 
 function readError(error) {

@@ -74,6 +74,7 @@ async def list_feedback(
     *,
     org_id: str,
     knowledge_base_id: str | None = None,
+    knowledge_base_ids: list[str] | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[Feedback]:
@@ -82,6 +83,10 @@ async def list_feedback(
         conditions = [FeedbackModel.org_id == UUID(org_id)]
         if knowledge_base_id:
             conditions.append(FeedbackModel.knowledge_base_id == UUID(knowledge_base_id))
+        elif knowledge_base_ids is not None:
+            if not knowledge_base_ids:
+                return []
+            conditions.append(FeedbackModel.knowledge_base_id.in_([UUID(item) for item in knowledge_base_ids]))
         rows = await session.scalars(
             select(FeedbackModel)
             .where(*conditions)
