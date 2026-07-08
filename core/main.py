@@ -23,7 +23,17 @@ from sqlalchemy.exc import IntegrityError
 from config.model import build_chat_model
 from config.settings import AppSettings
 from core.auth import CurrentUser, create_access_token, require_current_user
-from core.api_key_store import ApiKey, create_api_key, get_api_key, list_api_keys, revoke_api_key, revoke_api_keys_for_kb_user, verify_api_key
+from core.api_key_store import (
+    ApiKey,
+    adjust_api_key_token_usage,
+    create_api_key,
+    get_api_key,
+    list_api_keys,
+    reserve_api_key_usage,
+    revoke_api_key,
+    revoke_api_keys_for_kb_user,
+    verify_api_key_detailed,
+)
 from core.conversation_store import (
     Conversation,
     add_message,
@@ -54,6 +64,7 @@ from core.enterprise_store import (
     create_knowledge_base,
     create_user,
     deactivate_user,
+    get_default_org_id,
     get_knowledge_base,
     get_user_by_id,
     get_knowledge_base_capabilities,
@@ -122,6 +133,11 @@ from core.vector_store import (
     initialize_database_async,
     similarity_search,
 )
+
+
+DEFAULT_OPENAPI_COMPLETION_TOKEN_RESERVE = 1024
+DEFAULT_OPENAPI_CONTEXT_TOKEN_RESERVE_PER_SOURCE = 256
+DEFAULT_OPENAPI_REWRITE_TOKEN_RESERVE = 128
 
 
 class ChatRequest(BaseModel):
@@ -565,6 +581,10 @@ class AuditLogListResponse(BaseModel):
 class ApiKeyCreateRequest(BaseModel):
     name: str = Field(min_length=1)
     knowledge_base_id: str = Field(min_length=1)
+    purpose: str | None = Field(default=None, max_length=500)
+    expires_at: datetime | None = None
+    daily_request_limit: int | None = Field(default=None, ge=1, le=1_000_000)
+    daily_token_limit: int | None = Field(default=None, ge=1, le=100_000_000)
 
 
 class ApiKeyResponse(BaseModel):
@@ -573,8 +593,15 @@ class ApiKeyResponse(BaseModel):
     user_id: str
     knowledge_base_id: str
     name: str
+    purpose: str | None = None
     key_prefix: str
     is_active: bool
+    expires_at: str | None = None
+    daily_request_limit: int | None = None
+    daily_token_limit: int | None = None
+    daily_request_count: int = 0
+    daily_token_count: int = 0
+    quota_reset_date: str | None = None
     last_used_at: str | None = None
     created_at: str
 
@@ -611,6 +638,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[OpenAIChatMessage] = Field(min_length=1)
     temperature: float | None = None
+    max_tokens: int | None = Field(default=None, ge=1, le=16000)
     stream: bool = False
     top_k: int | None = Field(default=None, ge=1, le=50)
     rerank_top_n: int | None = Field(default=None, ge=0, le=50)
@@ -1250,6 +1278,15 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> ApiKeyCreateResponse:
         state = get_state(app)
+        if request.expires_at is not None:
+            now = datetime.now(timezone.utc)
+            expires_at = request.expires_at
+            if expires_at.tzinfo is None:
+                is_past_expiry = expires_at <= now.replace(tzinfo=None)
+            else:
+                is_past_expiry = expires_at <= now
+            if is_past_expiry:
+                raise HTTPException(status_code=422, detail="API key expiry must be in the future")
         await require_kb_capability_or_audit(
             state.settings,
             request=http_request,
@@ -1264,6 +1301,10 @@ def create_app() -> FastAPI:
             user_id=current_user.id,
             knowledge_base_id=request.knowledge_base_id,
             name=request.name,
+            purpose=request.purpose,
+            expires_at=request.expires_at,
+            daily_request_limit=request.daily_request_limit,
+            daily_token_limit=request.daily_token_limit,
         )
         await add_audit_log(
             state.settings,
@@ -1273,7 +1314,13 @@ def create_app() -> FastAPI:
             action="api_key.create",
             target_type="api_key",
             target_id=created.record.id,
-            metadata={"name": created.record.name, "knowledge_base_id": request.knowledge_base_id},
+            metadata={
+                "name": created.record.name,
+                "knowledge_base_id": request.knowledge_base_id,
+                "expires_at": created.record.expires_at.isoformat() if created.record.expires_at else None,
+                "daily_request_limit": created.record.daily_request_limit,
+                "daily_token_limit": created.record.daily_token_limit,
+            },
             **audit_context(http_request),
         )
         return ApiKeyCreateResponse(**api_key_response(created.record).model_dump(), secret=created.secret)
@@ -2768,7 +2815,13 @@ def create_app() -> FastAPI:
     ) -> RetrievalResponse:
         state = require_ready(app)
         started_at = time.perf_counter()
-        api_key = await require_valid_api_key(state.settings, authorization, x_api_key)
+        api_key = await require_valid_api_key(
+            state.settings,
+            authorization,
+            x_api_key,
+            request=http_request,
+            action="openapi.retrieval.auth",
+        )
         if api_key.knowledge_base_id != knowledge_base_id:
             await add_audit_log(
                 state.settings,
@@ -2784,6 +2837,15 @@ def create_app() -> FastAPI:
                 **audit_context(http_request),
             )
             raise HTTPException(status_code=403, detail="API key is not bound to this knowledge base")
+        estimated_tokens = max(1, len(request.query) // 4)
+        api_key = await enforce_api_key_quota(
+            state.settings,
+            request=http_request,
+            api_key=api_key,
+            action="openapi.retrieval.quota",
+            estimated_tokens=estimated_tokens,
+        )
+        usage = api_key
         try:
             retrieval = await hybrid_search(
                 state.settings,
@@ -2825,7 +2887,14 @@ def create_app() -> FastAPI:
             action="openapi.retrieval",
             target_type="knowledge_base",
             target_id=knowledge_base_id,
-            metadata={"api_key_id": api_key.id, "key_prefix": api_key.key_prefix, "top_k": request.top_k, "source_count": len(sources)},
+            metadata={
+                "api_key_id": api_key.id,
+                "key_prefix": api_key.key_prefix,
+                "top_k": request.top_k,
+                "source_count": len(sources),
+                "daily_request_count": usage.daily_request_count,
+                "daily_token_count": usage.daily_token_count,
+            },
             latency_ms=int((time.perf_counter() - started_at) * 1000),
             **audit_context(http_request),
         )
@@ -2838,15 +2907,36 @@ def create_app() -> FastAPI:
         authorization: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     ) -> dict[str, Any]:
-        if request.stream:
-            raise HTTPException(status_code=400, detail="Streaming is reserved but not enabled yet")
         state = require_ready(app)
-        api_key = await require_valid_api_key(state.settings, authorization, x_api_key)
+        api_key = await require_valid_api_key(
+            state.settings,
+            authorization,
+            x_api_key,
+            request=http_request,
+            action="openapi.chat_completion.auth",
+        )
         started_at = time.perf_counter()
         request_context = audit_context(http_request)
+        if request.stream:
+            await add_audit_log(
+                state.settings,
+                org_id=api_key.org_id,
+                actor_user_id=api_key.user_id,
+                action="openapi.chat_completion.stream",
+                target_type="api_key",
+                target_id=api_key.id,
+                metadata={"api_key_id": api_key.id, "key_prefix": api_key.key_prefix},
+                result="failed",
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                error_message="Streaming is reserved but not enabled yet",
+                **request_context,
+            )
+            raise HTTPException(status_code=400, detail="Streaming is reserved but not enabled yet")
         question = next((message.content for message in reversed(request.messages) if message.role == "user"), "")
         if not question:
             raise HTTPException(status_code=400, detail="At least one user message is required")
+        prompt_tokens = max(1, sum(len(message.content) for message in request.messages) // 4)
+        completion_token_limit = request.max_tokens or DEFAULT_OPENAPI_COMPLETION_TOKEN_RESERVE
         kb = await get_knowledge_base(state.settings, api_key.knowledge_base_id)
         top_k = request.top_k or (kb.retrieval_top_k if kb else None) or state.settings.rag_top_k
         rerank_top_n = (
@@ -2864,6 +2954,24 @@ def create_app() -> FastAPI:
             else 0.35
         )
         max_retries = request.max_retries if request.max_retries is not None else kb.low_confidence_max_retries if kb else 1
+        planned_attempts = build_retry_attempts(
+            top_k=top_k,
+            rerank_top_n=rerank_top_n,
+            max_retries=max_retries,
+            score_threshold=request.score_threshold,
+        )
+        reserved_tokens = estimate_chat_completion_reserve(
+            prompt_tokens=prompt_tokens,
+            completion_token_limit=completion_token_limit,
+            attempts=planned_attempts,
+        )
+        api_key = await enforce_api_key_quota(
+            state.settings,
+            request=http_request,
+            api_key=api_key,
+            action="openapi.chat_completion.quota",
+            estimated_tokens=reserved_tokens,
+        )
         history_text = "\n".join(f"{item.role}: {item.content}" for item in request.messages[:-1]) or "No prior messages."
         attempt_result = await run_cited_answer_attempts(
             state,
@@ -2877,6 +2985,7 @@ def create_app() -> FastAPI:
             low_confidence_threshold=low_confidence_threshold,
             max_retries=max_retries,
             score_threshold=request.score_threshold,
+            max_tokens=completion_token_limit,
         )
         answer = str(attempt_result["answer"])
         source_models = attempt_result["sources"]
@@ -2887,11 +2996,18 @@ def create_app() -> FastAPI:
         retry_count = int(attempt_result["retry_count"])
         auto_retry_triggered = bool(attempt_result["auto_retry_triggered"])
         final_low_confidence = bool(attempt_result["final_low_confidence"])
+        estimated_model_tokens = int(attempt_result["estimated_model_tokens"])
         sources = [source.model_dump() for source in source_models]
         conversation_id = request.conversation_id or str(uuid4())
         latency_ms = int((time.perf_counter() - started_at) * 1000)
-        prompt_tokens = sum(len(message.content) for message in request.messages) // 4
-        completion_tokens = len(answer) // 4
+        completion_tokens = max(1, len(answer) // 4)
+        total_estimated_tokens = max(prompt_tokens + completion_tokens, estimated_model_tokens)
+        usage = await adjust_api_key_token_usage(
+            state.settings,
+            api_key.id,
+            reserved_tokens=reserved_tokens,
+            actual_tokens=total_estimated_tokens,
+        )
         await add_chat_log(
             state.settings,
             org_id=api_key.org_id,
@@ -2906,7 +3022,7 @@ def create_app() -> FastAPI:
             model_name=request.model or state.settings.openai_model,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
+            total_tokens=total_estimated_tokens,
             citation_count=int(citation_result["citation_count"]),
             citation_coverage=float(citation_result["citation_coverage"]),
             answer_status=str(citation_result["answer_status"]),
@@ -2939,6 +3055,10 @@ def create_app() -> FastAPI:
                 "auto_retry_triggered": auto_retry_triggered,
                 "final_low_confidence": final_low_confidence,
                 "retry_trace": retry_trace,
+                "reserved_tokens": reserved_tokens,
+                "estimated_model_tokens": estimated_model_tokens,
+                "daily_request_count": usage.daily_request_count,
+                "daily_token_count": usage.daily_token_count,
             },
             latency_ms=latency_ms,
             **request_context,
@@ -2958,7 +3078,7 @@ def create_app() -> FastAPI:
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
+                "total_tokens": total_estimated_tokens,
             },
             "sources": sources,
             "confidence": confidence,
@@ -3263,6 +3383,27 @@ def build_retry_attempts(
     return attempts
 
 
+def estimate_text_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def estimate_chat_completion_reserve(
+    *,
+    prompt_tokens: int,
+    completion_token_limit: int,
+    attempts: list[dict[str, Any]],
+) -> int:
+    answer_budget = sum(
+        prompt_tokens
+        + max(1, int(attempt["top_k"])) * DEFAULT_OPENAPI_CONTEXT_TOKEN_RESERVE_PER_SOURCE
+        + completion_token_limit
+        for attempt in attempts
+    )
+    rewrite_count = sum(1 for attempt in attempts if attempt["query_rewrite_enabled"])
+    rewrite_budget = rewrite_count * (prompt_tokens + DEFAULT_OPENAPI_REWRITE_TOKEN_RESERVE)
+    return max(1, answer_budget + rewrite_budget)
+
+
 def document_fallback_score(document: Document) -> float | None:
     for key in ("hybrid_score", "vector_score", "bm25_score"):
         value = document.metadata.get(key)
@@ -3284,9 +3425,11 @@ async def run_cited_answer_attempts(
     low_confidence_threshold: float,
     max_retries: int,
     score_threshold: float | None = None,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     retry_trace: list[dict[str, Any]] = []
     final: dict[str, Any] | None = None
+    estimated_model_tokens = 0
     for attempt in build_retry_attempts(
         top_k=top_k,
         rerank_top_n=rerank_top_n,
@@ -3299,10 +3442,13 @@ async def run_cited_answer_attempts(
                 question,
                 history,
                 state.settings.openai_timeout_seconds,
+                max_tokens=DEFAULT_OPENAPI_REWRITE_TOKEN_RESERVE,
             )
             if attempt["query_rewrite_enabled"]
             else question
         )
+        if attempt["query_rewrite_enabled"]:
+            estimated_model_tokens += estimate_text_tokens(f"{history_text}\n{question}\n{retrieval_query}")
         retrieval = await asyncio.wait_for(
             hybrid_search(
                 state.settings,
@@ -3335,10 +3481,11 @@ async def run_cited_answer_attempts(
                 if item.score is None or float(item.score) >= float(attempt["score_threshold"])
             ]
         if selected:
+            context_text = format_context([item.document for item in selected])
             prompt = build_prompt().invoke(
                 {
                     "question": question,
-                    "context": format_context([item.document for item in selected]),
+                    "context": context_text,
                     "history": history_text,
                 }
             )
@@ -3348,8 +3495,13 @@ async def run_cited_answer_attempts(
                         state.chat_model,
                         prompt,
                         state.settings.openai_timeout_seconds,
+                        max_tokens=max_tokens,
                     )
                 ).content
+            )
+            estimated_model_tokens += (
+                estimate_text_tokens(f"{history_text}\n{question}\n{context_text}")
+                + estimate_text_tokens(answer)
             )
         else:
             answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
@@ -3410,6 +3562,7 @@ async def run_cited_answer_attempts(
         "retry_trace": retry_trace,
         "auto_retry_triggered": retry_count > 0,
         "final_low_confidence": final_low_confidence,
+        "estimated_model_tokens": estimated_model_tokens,
     }
 
 
@@ -3475,8 +3628,15 @@ def api_key_response(api_key: ApiKey) -> ApiKeyResponse:
         user_id=api_key.user_id,
         knowledge_base_id=api_key.knowledge_base_id,
         name=api_key.name,
+        purpose=api_key.purpose,
         key_prefix=api_key.key_prefix,
         is_active=api_key.is_active,
+        expires_at=api_key.expires_at.isoformat() if api_key.expires_at else None,
+        daily_request_limit=api_key.daily_request_limit,
+        daily_token_limit=api_key.daily_token_limit,
+        daily_request_count=api_key.daily_request_count,
+        daily_token_count=api_key.daily_token_count,
+        quota_reset_date=api_key.quota_reset_date.isoformat() if api_key.quota_reset_date else None,
         last_used_at=api_key.last_used_at.isoformat() if api_key.last_used_at else None,
         created_at=api_key.created_at.isoformat(),
     )
@@ -3621,6 +3781,8 @@ async def require_valid_api_key(
     settings: AppSettings,
     authorization: str | None,
     x_api_key: str | None,
+    request: Request | None = None,
+    action: str = "openapi.auth",
 ) -> ApiKey:
     secret = x_api_key
     if not secret and authorization:
@@ -3629,11 +3791,89 @@ async def require_valid_api_key(
         elif authorization.lower().startswith("api-key "):
             secret = authorization.split(" ", 1)[1].strip()
     if not secret:
+        if request is not None:
+            audit_org_id = await get_default_org_id(settings)
+            if audit_org_id:
+                await add_audit_log(
+                    settings,
+                    org_id=audit_org_id,
+                    actor_user_id=None,
+                    action=action,
+                    target_type="api_key",
+                    metadata={"reason": "missing"},
+                    result="failed",
+                    error_message="API key required",
+                    **audit_context(request),
+                )
         raise HTTPException(status_code=401, detail="API key required")
-    api_key = await verify_api_key(settings, secret)
-    if api_key is None:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return api_key
+    verification = await verify_api_key_detailed(settings, secret)
+    if verification.api_key is None:
+        status_code = 403 if verification.reason == "forbidden" else 401
+        detail = {
+            "invalid": "Invalid API key",
+            "disabled": "API key is disabled",
+            "inactive_binding": "API key binding is inactive",
+            "expired": "API key expired",
+            "forbidden": "API key owner no longer has access to this knowledge base",
+        }.get(verification.reason or "invalid", "Invalid API key")
+        audit_org_id = verification.org_id
+        if request is not None and not audit_org_id:
+            audit_org_id = await get_default_org_id(settings)
+        if request is not None and audit_org_id:
+            await add_audit_log(
+                settings,
+                org_id=audit_org_id,
+                actor_user_id=verification.user_id,
+                action=action,
+                target_type="api_key",
+                target_id=None,
+                metadata={
+                    "key_prefix": verification.key_prefix,
+                    "knowledge_base_id": verification.knowledge_base_id,
+                    "reason": verification.reason,
+                },
+                result="failed",
+                error_message=detail,
+                **audit_context(request),
+            )
+        raise HTTPException(status_code=status_code, detail=detail)
+    return verification.api_key
+
+
+async def enforce_api_key_quota(
+    settings: AppSettings,
+    *,
+    request: Request,
+    api_key: ApiKey,
+    action: str,
+    estimated_tokens: int = 0,
+) -> ApiKey:
+    verification = await reserve_api_key_usage(settings, api_key.id, estimated_tokens=estimated_tokens)
+    if verification.api_key is not None:
+        return verification.api_key
+    detail = {
+        "request_quota_exceeded": "API key daily request quota exceeded",
+        "token_quota_exceeded": "API key daily token quota exceeded",
+    }.get(verification.reason or "request_quota_exceeded", "API key quota exceeded")
+    await add_audit_log(
+        settings,
+        org_id=api_key.org_id,
+        actor_user_id=api_key.user_id,
+        action=action,
+        target_type="api_key",
+        target_id=api_key.id,
+        metadata={
+            "api_key_id": api_key.id,
+            "key_prefix": api_key.key_prefix,
+            "knowledge_base_id": api_key.knowledge_base_id,
+            "reason": verification.reason,
+            "estimated_tokens": estimated_tokens,
+        },
+        result="failed",
+        error_message=detail,
+        **audit_context(request),
+    )
+    raise HTTPException(status_code=429, detail=detail)
 
 
 async def require_kb_member_admin(settings: AppSettings, kb_id: str, user: CurrentUser) -> None:
@@ -4086,7 +4326,13 @@ def rewrite_query(chat_model: Any, question: str, history: list[Any]) -> str:
         return question
 
 
-async def rewrite_query_async(chat_model: Any, question: str, history: list[Any], timeout_seconds: int) -> str:
+async def rewrite_query_async(
+    chat_model: Any,
+    question: str,
+    history: list[Any],
+    timeout_seconds: int,
+    max_tokens: int | None = None,
+) -> str:
     if not history:
         return question
     try:
@@ -4100,14 +4346,15 @@ async def rewrite_query_async(chat_model: Any, question: str, history: list[Any]
                 ("human", "History:\n{history}\n\nLatest question:\n{question}"),
             ]
         ).invoke({"history": format_history(history), "question": question})
-        rewritten = str((await invoke_chat_model(chat_model, prompt, timeout_seconds)).content).strip()
+        rewritten = str((await invoke_chat_model(chat_model, prompt, timeout_seconds, max_tokens=max_tokens)).content).strip()
         return rewritten or question
     except Exception:  # noqa: BLE001
         return question
 
 
-async def invoke_chat_model(chat_model: Any, prompt: Any, timeout_seconds: int) -> Any:
-    return await asyncio.wait_for(chat_model.ainvoke(prompt), timeout=timeout_seconds)
+async def invoke_chat_model(chat_model: Any, prompt: Any, timeout_seconds: int, max_tokens: int | None = None) -> Any:
+    model = chat_model.bind(max_tokens=max_tokens) if max_tokens else chat_model
+    return await asyncio.wait_for(model.ainvoke(prompt), timeout=timeout_seconds)
 
 
 def conversation_response(conversation: Conversation) -> ConversationResponse:

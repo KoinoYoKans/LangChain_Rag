@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import date, datetime
 from functools import lru_cache
 from typing import Any
 from uuid import UUID as PyUUID
 
 from dotenv import load_dotenv
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, Float, Index, Integer, String, Text, func, text
+from sqlalchemy import BigInteger, CheckConstraint, Date, DateTime, Float, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -336,9 +336,16 @@ class ApiKeyModel(Base):
     user_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     knowledge_base_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
+    purpose: Mapped[str | None] = mapped_column(Text)
     key_prefix: Mapped[str] = mapped_column(String, nullable=False)
     key_hash: Mapped[str] = mapped_column(Text, nullable=False)
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    daily_request_limit: Mapped[int | None] = mapped_column(Integer)
+    daily_token_limit: Mapped[int | None] = mapped_column(Integer)
+    daily_request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    daily_token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    quota_reset_date: Mapped[date | None] = mapped_column(Date)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -494,6 +501,19 @@ async def _migrate_existing_tables(connection: Any, settings: AppSettings) -> No
     }
     for column, column_type in audit_columns.items():
         await connection.execute(text(f'alter table "rag_audit_logs" add column if not exists {column} {column_type}'))
+
+    api_key_table = os.getenv("API_KEY_TABLE", "rag_api_keys")
+    api_key_columns = {
+        "purpose": "text",
+        "expires_at": "timestamp with time zone",
+        "daily_request_limit": "integer",
+        "daily_token_limit": "integer",
+        "daily_request_count": "integer not null default 0",
+        "daily_token_count": "integer not null default 0",
+        "quota_reset_date": "date",
+    }
+    for column, column_type in api_key_columns.items():
+        await connection.execute(text(f'alter table "{api_key_table}" add column if not exists {column} {column_type}'))
 
     await connection.execute(text(f'drop index if exists "{file_table}_content_sha256_uidx"'))
     await connection.execute(

@@ -150,6 +150,13 @@ async def bootstrap_default_org(settings: AppSettings) -> EnterpriseUser:
         return _user_to_dataclass(user)
 
 
+async def get_default_org_id(settings: AppSettings) -> str | None:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        org = await session.scalar(select(OrganizationModel).where(OrganizationModel.name == settings.default_org_name))
+        return str(org.id) if org else None
+
+
 async def authenticate_user(settings: AppSettings, email: str, password: str) -> EnterpriseUser | None:
     from core.auth import verify_password
 

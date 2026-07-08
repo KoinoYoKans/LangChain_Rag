@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -20,8 +20,15 @@ class ApiKey:
     user_id: str
     knowledge_base_id: str
     name: str
+    purpose: str | None
     key_prefix: str
     is_active: bool
+    expires_at: datetime | None
+    daily_request_limit: int | None
+    daily_token_limit: int | None
+    daily_request_count: int
+    daily_token_count: int
+    quota_reset_date: Any | None
     last_used_at: datetime | None
     created_at: datetime
 
@@ -32,6 +39,16 @@ class CreatedApiKey:
     secret: str
 
 
+@dataclass(frozen=True)
+class ApiKeyVerificationResult:
+    api_key: ApiKey | None
+    reason: str | None
+    key_prefix: str | None = None
+    org_id: str | None = None
+    user_id: str | None = None
+    knowledge_base_id: str | None = None
+
+
 async def create_api_key(
     settings: AppSettings,
     *,
@@ -39,6 +56,10 @@ async def create_api_key(
     user_id: str,
     knowledge_base_id: str,
     name: str,
+    purpose: str | None = None,
+    expires_at: datetime | None = None,
+    daily_request_limit: int | None = None,
+    daily_token_limit: int | None = None,
 ) -> CreatedApiKey:
     secret = f"rag-{secrets.token_urlsafe(32)}"
     prefix = secret[:12]
@@ -48,9 +69,14 @@ async def create_api_key(
         user_id=UUID(user_id),
         knowledge_base_id=UUID(knowledge_base_id),
         name=name,
+        purpose=purpose,
         key_prefix=prefix,
         key_hash=_hash_key(secret),
         is_active=True,
+        expires_at=expires_at,
+        daily_request_limit=daily_request_limit,
+        daily_token_limit=daily_token_limit,
+        quota_reset_date=datetime.now(timezone.utc).date(),
     )
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
@@ -63,7 +89,7 @@ async def create_api_key(
 async def list_api_keys(settings: AppSettings, org_id: str, knowledge_base_ids: list[str] | None = None) -> list[ApiKey]:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
-        conditions = [ApiKeyModel.org_id == UUID(org_id), ApiKeyModel.is_active.is_(True)]
+        conditions = [ApiKeyModel.org_id == UUID(org_id)]
         if knowledge_base_ids is not None:
             if not knowledge_base_ids:
                 return []
@@ -73,7 +99,11 @@ async def list_api_keys(settings: AppSettings, org_id: str, knowledge_base_ids: 
             .where(*conditions)
             .order_by(ApiKeyModel.created_at.desc())
         )
-        return [_to_dataclass(item) for item in result]
+        items = list(result)
+        for item in items:
+            _reset_quota_if_needed(item)
+        await session.commit()
+        return [_to_dataclass(item) for item in items]
 
 
 async def get_api_key(settings: AppSettings, org_id: str, api_key_id: str) -> ApiKey | None:
@@ -124,6 +154,11 @@ async def revoke_api_keys_for_kb_user(settings: AppSettings, *, kb_id: str, user
 
 
 async def verify_api_key(settings: AppSettings, secret: str) -> ApiKey | None:
+    result = await verify_api_key_detailed(settings, secret)
+    return result.api_key
+
+
+async def verify_api_key_detailed(settings: AppSettings, secret: str) -> ApiKeyVerificationResult:
     prefix = secret[:12]
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
@@ -133,25 +168,72 @@ async def verify_api_key(settings: AppSettings, secret: str) -> ApiKey | None:
             .join(UserModel, ApiKeyModel.user_id == UserModel.id)
             .where(
                 ApiKeyModel.key_prefix == prefix,
-                ApiKeyModel.is_active.is_(True),
-                KnowledgeBaseModel.status != "deleted",
-                UserModel.is_active.is_(True),
             )
         )
         result = row.one_or_none()
         if result is None:
-            return None
+            return ApiKeyVerificationResult(api_key=None, reason="invalid", key_prefix=prefix)
         model, knowledge_base, user = result
         if model is None or model.key_hash != _hash_key(secret):
-            return None
+            return ApiKeyVerificationResult(api_key=None, reason="invalid", key_prefix=prefix)
+        if not model.is_active:
+            return _verification_failure(model, "disabled")
+        if knowledge_base.status == "deleted" or not user.is_active:
+            return _verification_failure(model, "inactive_binding")
+        if _is_expired(model.expires_at):
+            return _verification_failure(model, "expired")
         if not await _api_key_user_can_manage_bound_kb(session, knowledge_base, user):
-            return None
-        await session.execute(
-            update(ApiKeyModel)
-            .where(ApiKeyModel.id == model.id)
-            .values(last_used_at=datetime.utcnow())
-        )
+            return _verification_failure(model, "forbidden")
+        _reset_quota_if_needed(model)
         await session.commit()
+        return ApiKeyVerificationResult(api_key=_to_dataclass(model), reason=None, key_prefix=prefix)
+
+
+async def reserve_api_key_usage(settings: AppSettings, api_key_id: str, estimated_tokens: int = 0) -> ApiKeyVerificationResult:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            model = await session.scalar(
+                select(ApiKeyModel)
+                .where(ApiKeyModel.id == UUID(api_key_id))
+                .with_for_update()
+            )
+            if model is None:
+                return ApiKeyVerificationResult(api_key=None, reason="invalid")
+            _reset_quota_if_needed(model)
+            reserved_tokens = max(0, estimated_tokens)
+            if not model.is_active:
+                return _verification_failure(model, "disabled")
+            if _is_expired(model.expires_at):
+                return _verification_failure(model, "expired")
+            if model.daily_request_limit is not None and model.daily_request_count + 1 > model.daily_request_limit:
+                return _verification_failure(model, "request_quota_exceeded")
+            if model.daily_token_limit is not None and model.daily_token_count + reserved_tokens > model.daily_token_limit:
+                return _verification_failure(model, "token_quota_exceeded")
+            model.daily_request_count += 1
+            model.daily_token_count += reserved_tokens
+            model.last_used_at = datetime.now(timezone.utc)
+        await session.refresh(model)
+        return ApiKeyVerificationResult(api_key=_to_dataclass(model), reason=None, key_prefix=model.key_prefix)
+
+
+async def adjust_api_key_token_usage(settings: AppSettings, api_key_id: str, reserved_tokens: int, actual_tokens: int) -> ApiKey:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            model = await session.scalar(
+                select(ApiKeyModel)
+                .where(ApiKeyModel.id == UUID(api_key_id))
+                .with_for_update()
+            )
+            if model is None:
+                raise ValueError("API key not found")
+            today = datetime.now(timezone.utc).date()
+            if model.quota_reset_date == today:
+                delta = max(0, actual_tokens) - max(0, reserved_tokens)
+                model.daily_token_count = max(0, model.daily_token_count + delta)
+            model.last_used_at = datetime.now(timezone.utc)
+        await session.refresh(model)
         return _to_dataclass(model)
 
 
@@ -174,6 +256,34 @@ def _hash_key(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
 
+def _verification_failure(model: ApiKeyModel, reason: str) -> ApiKeyVerificationResult:
+    return ApiKeyVerificationResult(
+        api_key=None,
+        reason=reason,
+        key_prefix=model.key_prefix,
+        org_id=str(model.org_id),
+        user_id=str(model.user_id),
+        knowledge_base_id=str(model.knowledge_base_id),
+    )
+
+
+def _is_expired(expires_at: datetime | None) -> bool:
+    if expires_at is None:
+        return False
+    now = datetime.now(timezone.utc)
+    if expires_at.tzinfo is None:
+        return expires_at <= now.replace(tzinfo=None)
+    return expires_at <= now
+
+
+def _reset_quota_if_needed(model: ApiKeyModel) -> None:
+    today = datetime.now(timezone.utc).date()
+    if model.quota_reset_date != today:
+        model.daily_request_count = 0
+        model.daily_token_count = 0
+        model.quota_reset_date = today
+
+
 def _to_dataclass(model: ApiKeyModel) -> ApiKey:
     return ApiKey(
         id=str(model.id),
@@ -181,8 +291,15 @@ def _to_dataclass(model: ApiKeyModel) -> ApiKey:
         user_id=str(model.user_id),
         knowledge_base_id=str(model.knowledge_base_id),
         name=model.name,
+        purpose=model.purpose,
         key_prefix=model.key_prefix,
         is_active=bool(model.is_active),
+        expires_at=model.expires_at,
+        daily_request_limit=model.daily_request_limit,
+        daily_token_limit=model.daily_token_limit,
+        daily_request_count=int(model.daily_request_count or 0),
+        daily_token_count=int(model.daily_token_count or 0),
+        quota_reset_date=model.quota_reset_date,
         last_used_at=model.last_used_at,
         created_at=model.created_at,
     )
