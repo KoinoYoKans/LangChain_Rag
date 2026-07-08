@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -128,6 +129,9 @@ class ChatRequest(BaseModel):
 
 
 class Source(BaseModel):
+    source_index: int | None = None
+    source_type: str | None = None
+    source_uri: str | None = None
     file_id: str | None
     chunk_id: str | None
     document_id: str | None
@@ -152,6 +156,9 @@ class ChatResponse(BaseModel):
     sources: list[Source]
     confidence: str
     confidence_score: float | None = None
+    answer_status: str = "supported"
+    citation_count: int = 0
+    citation_coverage: float = 0.0
 
 
 class FeedbackRequest(BaseModel):
@@ -2056,10 +2063,16 @@ def create_app() -> FastAPI:
             else:
                 answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
             sources = [
-                source_from_document(item.document, rerank_score=item.score)
-                for item in selected
+                source_from_document(item.document, rerank_score=item.score, source_index=index)
+                for index, item in enumerate(selected, start=1)
             ]
-            confidence, confidence_score = answer_confidence(sources)
+            citation_result = evaluate_citations(str(answer), sources)
+            if citation_result["answer_status"] != "supported":
+                answer = insufficient_evidence_answer(citation_result["answer_status"])
+                confidence = "low"
+                confidence_score = citation_result["citation_coverage"]
+            else:
+                confidence, confidence_score = answer_confidence(sources)
             assistant_message = await add_message(
                 state.settings,
                 message_id=str(uuid4()),
@@ -2073,6 +2086,9 @@ def create_app() -> FastAPI:
                     "sources": [source.model_dump() for source in sources],
                     "confidence": confidence,
                     "confidence_score": confidence_score,
+                    "answer_status": citation_result["answer_status"],
+                    "citation_count": citation_result["citation_count"],
+                    "citation_coverage": citation_result["citation_coverage"],
                 },
             )
             await add_chat_log(
@@ -2096,6 +2112,9 @@ def create_app() -> FastAPI:
                 metadata={
                     "conversation_id": conversation_id,
                     "source_count": len(sources),
+                    "citation_count": citation_result["citation_count"],
+                    "citation_coverage": citation_result["citation_coverage"],
+                    "answer_status": citation_result["answer_status"],
                     "query": request.message,
                     "retrieval_query": retrieval_query,
                 },
@@ -2147,6 +2166,9 @@ def create_app() -> FastAPI:
             sources=sources,
             confidence=confidence,
             confidence_score=confidence_score,
+            answer_status=str(citation_result["answer_status"]),
+            citation_count=int(citation_result["citation_count"]),
+            citation_coverage=float(citation_result["citation_coverage"]),
         )
 
     @app.post("/feedback", response_model=FeedbackResponse)
@@ -2286,7 +2308,10 @@ def create_app() -> FastAPI:
                 retrieval.documents,
                 min(request.top_k, state.settings.rerank_top_n or request.top_k),
             )
-            sources = [source_from_document(item.document, item.score) for item in ranked]
+            sources = [
+                source_from_document(item.document, item.score, source_index=index)
+                for index, item in enumerate(ranked, start=1)
+            ]
         except Exception as exc:  # noqa: BLE001
             await add_audit_log(
                 state.settings,
@@ -2371,8 +2396,18 @@ def create_app() -> FastAPI:
             )).content)
         else:
             answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
-        sources = [source_from_document(item.document, item.score).model_dump() for item in selected]
-        confidence, confidence_score = answer_confidence([Source(**source) for source in sources])
+        source_models = [
+            source_from_document(item.document, item.score, source_index=index)
+            for index, item in enumerate(selected, start=1)
+        ]
+        citation_result = evaluate_citations(str(answer), source_models)
+        if citation_result["answer_status"] != "supported":
+            answer = insufficient_evidence_answer(citation_result["answer_status"])
+            confidence = "low"
+            confidence_score = citation_result["citation_coverage"]
+        else:
+            confidence, confidence_score = answer_confidence(source_models)
+        sources = [source.model_dump() for source in source_models]
         conversation_id = request.conversation_id or str(uuid4())
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         await add_chat_log(
@@ -2393,7 +2428,14 @@ def create_app() -> FastAPI:
             action="openapi.chat_completion",
             target_type="knowledge_base",
             target_id=api_key.knowledge_base_id,
-            metadata={"api_key_id": api_key.id, "conversation_id": conversation_id, "source_count": len(sources)},
+            metadata={
+                "api_key_id": api_key.id,
+                "conversation_id": conversation_id,
+                "source_count": len(sources),
+                "citation_count": citation_result["citation_count"],
+                "citation_coverage": citation_result["citation_coverage"],
+                "answer_status": citation_result["answer_status"],
+            },
             latency_ms=latency_ms,
             **audit_context(http_request),
         )
@@ -2419,6 +2461,9 @@ def create_app() -> FastAPI:
             "sources": sources,
             "confidence": confidence,
             "confidence_score": confidence_score,
+            "answer_status": citation_result["answer_status"],
+            "citation_count": citation_result["citation_count"],
+            "citation_coverage": citation_result["citation_coverage"],
             "conversation_id": conversation_id,
         }
 
@@ -2504,7 +2549,9 @@ def build_prompt() -> ChatPromptTemplate:
                 "You are a RAG assistant. Answer using only the provided context. "
                 "If the context does not contain the answer, say you do not know. "
                 "Use the same language as the user's question. "
-                "Conversation history is for continuity only; retrieved context is the source of truth.",
+                "Conversation history is for continuity only; retrieved context is the source of truth. "
+                "Every factual claim must include source citations like [1] or [2]. "
+                "Only cite source numbers that appear in the provided context.",
             ),
             (
                 "human",
@@ -2521,13 +2568,14 @@ def format_context(documents: list[Document]) -> str:
     for index, document in enumerate(documents, start=1):
         filename = document.metadata.get("filename", "unknown")
         chunk_index = document.metadata.get("chunk_index", "unknown")
+        page_number = document.metadata.get("page_number")
         parts.append(
-            f"[{index}] source={filename} chunk={chunk_index}\n{document.page_content}"
+            f"[{index}] source={filename} page={page_number or '-'} chunk={chunk_index}\n{document.page_content}"
         )
     return "\n\n".join(parts)
 
 
-def source_from_document(document: Document, rerank_score: float | None) -> Source:
+def source_from_document(document: Document, rerank_score: float | None, source_index: int | None = None) -> Source:
     metadata = document.metadata
     snippet = document.page_content.strip().replace("\n", " ")
     if len(snippet) > 300:
@@ -2537,6 +2585,9 @@ def source_from_document(document: Document, rerank_score: float | None) -> Sour
     hybrid_score = metadata.get("hybrid_score")
     bbox = metadata.get("bbox")
     return Source(
+        source_index=source_index,
+        source_type=metadata.get("source_type"),
+        source_uri=metadata.get("source_uri"),
         file_id=metadata.get("file_id"),
         chunk_id=metadata.get("chunk_id"),
         document_id=metadata.get("document_id"),
@@ -2552,6 +2603,88 @@ def source_from_document(document: Document, rerank_score: float | None) -> Sour
         bbox={key: float(value) for key, value in bbox.items()} if isinstance(bbox, dict) else None,
         snippet=snippet,
     )
+
+
+def evaluate_citations(answer: str, sources: list[Source]) -> dict[str, Any]:
+    valid_indexes = {source.source_index for source in sources if source.source_index is not None}
+    cited_indexes = extract_citation_indexes(answer)
+    unique_citations = set(cited_indexes)
+    if not sources:
+        return {"answer_status": "no_sources", "citation_count": 0, "citation_coverage": 0.0}
+    if not cited_indexes:
+        return {"answer_status": "citation_missing", "citation_count": 0, "citation_coverage": 0.0}
+    if not unique_citations.issubset(valid_indexes):
+        return {
+            "answer_status": "citation_invalid",
+            "citation_count": len(unique_citations & valid_indexes),
+            "citation_coverage": 0.0,
+        }
+    cited_paragraphs = citation_covered_paragraph_count(answer)
+    factual_paragraphs = factual_paragraph_count(answer)
+    if factual_paragraphs and cited_paragraphs < factual_paragraphs:
+        return {
+            "answer_status": "citation_incomplete",
+            "citation_count": len(unique_citations),
+            "citation_coverage": round(cited_paragraphs / factual_paragraphs, 4),
+        }
+    citation_count = len(unique_citations)
+    coverage = cited_paragraphs / max(factual_paragraphs, 1)
+    return {"answer_status": "supported", "citation_count": citation_count, "citation_coverage": round(min(coverage, 1.0), 4)}
+
+
+def extract_citation_indexes(text: str) -> list[int]:
+    indexes: list[int] = []
+    for raw in re.findall(r"[\[【]([0-9,\s，、-]+)[\]】]", text):
+        for part in re.split(r"[,，、\s]+", raw.strip()):
+            if not part:
+                continue
+            if "-" in part:
+                start_text, end_text = part.split("-", 1)
+                if start_text.isdigit() and end_text.isdigit():
+                    start, end = int(start_text), int(end_text)
+                    if 0 < start <= end <= start + 10:
+                        indexes.extend(range(start, end + 1))
+                continue
+            if part.isdigit():
+                indexes.append(int(part))
+    return indexes
+
+
+def factual_paragraph_count(answer: str) -> int:
+    paragraphs = [part.strip() for part in re.split(r"\n+|(?<=[。！？.!?])\s+", answer) if part.strip()]
+    return sum(1 for paragraph in paragraphs if not is_non_factual_paragraph(paragraph))
+
+
+def citation_covered_paragraph_count(answer: str) -> int:
+    paragraphs = [part.strip() for part in re.split(r"\n+|(?<=[。！？.!?])\s+", answer) if part.strip()]
+    return sum(1 for paragraph in paragraphs if not is_non_factual_paragraph(paragraph) and extract_citation_indexes(paragraph))
+
+
+def is_non_factual_paragraph(paragraph: str) -> bool:
+    normalized = paragraph.strip().lower()
+    prefixes = (
+        "抱歉",
+        "无法",
+        "没有",
+        "当前知识库",
+        "请补充",
+        "i don't know",
+        "i do not know",
+        "not enough",
+        "no relevant",
+    )
+    return any(normalized.startswith(prefix) for prefix in prefixes)
+
+
+def insufficient_evidence_answer(answer_status: str) -> str:
+    reasons = {
+        "no_sources": "当前知识库没有检索到可用于回答该问题的证据。",
+        "citation_missing": "模型生成的答案缺少可验证引用。",
+        "citation_invalid": "模型生成的答案包含无效引用。",
+        "citation_incomplete": "模型生成的答案存在未标注引用的事实段落。",
+    }
+    reason = reasons.get(answer_status, "当前知识库没有足够证据回答该问题。")
+    return f"{reason} 请补充相关文档、换一种问法，或查看下方候选来源后重试。"
 
 
 def answer_confidence(sources: list[Source]) -> tuple[str, float | None]:

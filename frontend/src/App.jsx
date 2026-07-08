@@ -673,6 +673,38 @@ function JobTable({ jobs, loading, retryJob, cancelJob, selectedJobIds, setSelec
   );
 }
 
+function SourceDrawer({ source, onClose, onOpenPreview }) {
+  return (
+    <Drawer width={520} title={source?.filename || "引用来源"} open={Boolean(source)} onClose={onClose}>
+      {source && (
+        <Space direction="vertical" size={14} className="full-select">
+          <Space wrap>
+            <Tag color="blue">[{source.source_index || "-"}]</Tag>
+            <Tag>{source.source_type || "document"}</Tag>
+            <Tag>分块 {source.chunk_index ?? "-"}</Tag>
+            <Tag>页码 {source.page_number ?? "-"}</Tag>
+          </Space>
+          <Descriptions
+            bordered
+            column={1}
+            size="small"
+            items={[
+              { key: "filename", label: "文件", children: source.filename || "-" },
+              { key: "file_id", label: "文件 ID", children: source.file_id || "-" },
+              { key: "chunk_id", label: "分块 ID", children: source.chunk_id || "-" },
+              { key: "source_uri", label: "来源 URI", children: source.source_uri || "-" },
+              { key: "score", label: "相关分", children: scoreText(source.rerank_score ?? source.hybrid_score ?? source.vector_score) },
+            ]}
+          />
+          <Typography.Title level={5}>原文片段</Typography.Title>
+          <div className="source-snippet">{source.snippet || "-"}</div>
+          <Button icon={<EyeOutlined />} disabled={!source.file_id} onClick={() => onOpenPreview(source)}>打开文档预览</Button>
+        </Space>
+      )}
+    </Drawer>
+  );
+}
+
 function DocumentPreview({ api, kbId, file, onClose }) {
   const preview = useQuery({
     queryKey: ["preview", kbId, file?.id],
@@ -735,6 +767,8 @@ function ChatWorkspace({ api }) {
   const [kbId, setKbId] = useState("");
   const [conversationId, setConversationId] = useState("");
   const [messages, setMessages] = useState([]);
+  const [activeSource, setActiveSource] = useState(null);
+  const [previewSourceFile, setPreviewSourceFile] = useState(null);
   const [form] = Form.useForm();
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
   const activeKbRecord = (kbs.data || []).find((item) => item.id === kbId);
@@ -843,6 +877,15 @@ function ChatWorkspace({ api }) {
     });
   }
 
+  function openSource(source) {
+    setActiveSource(source);
+  }
+
+  function openSourcePreview(source) {
+    if (!source?.file_id) return;
+    setPreviewSourceFile({ id: source.file_id, filename: source.filename || "来源文档" });
+  }
+
   function dislikeAnswer(item) {
     let reason = "answer_wrong";
     let comment = "";
@@ -912,6 +955,7 @@ function ChatWorkspace({ api }) {
                 <Typography.Title level={5}>{item.question}</Typography.Title>
                 <Space>
                   <Tag color={confidenceColor(item.confidence)}>{confidenceText(item.confidence, item.confidence_score)}</Tag>
+                  <Tag>{answerStatusText(item.answer_status)}</Tag>
                   {item.assistant_message_id && (
                     <>
                       <Button size="small" icon={<LikeOutlined />} onClick={() => submitFeedback(item, "up")} />
@@ -920,7 +964,7 @@ function ChatWorkspace({ api }) {
                   )}
                 </Space>
               </Flex>
-              <Typography.Paragraph>{item.answer}</Typography.Paragraph>
+              <Typography.Paragraph className="answer-content">{renderAnswerWithCitations(item.answer, item.sources || [], openSource)}</Typography.Paragraph>
               <Table
                 rowKey={(row, index) => `${row.chunk_id}-${index}`}
                 size="small"
@@ -928,6 +972,7 @@ function ChatWorkspace({ api }) {
                 dataSource={item.sources}
                 columns={[
                   { title: "文件", dataIndex: "filename" },
+                  { title: "引用", dataIndex: "source_index", width: 70, render: (value, row) => <Button size="small" type="link" onClick={() => openSource(row)}>[{value || "-"}]</Button> },
                   { title: "分块", dataIndex: "chunk_index", width: 80 },
                   { title: "页码", dataIndex: "page_number", width: 80, render: (value) => value || "-" },
                   { title: "分数", width: 140, render: (_, row) => scoreText(row.rerank_score ?? row.hybrid_score ?? row.vector_score) },
@@ -938,6 +983,8 @@ function ChatWorkspace({ api }) {
           ))}
         </div>
       </div>
+      <SourceDrawer source={activeSource} onClose={() => setActiveSource(null)} onOpenPreview={openSourcePreview} />
+      <DocumentPreview api={api} kbId={kbId} file={previewSourceFile} onClose={() => setPreviewSourceFile(null)} />
     </section>
   );
 }
@@ -1272,6 +1319,9 @@ function buildChatRecordsFromMessages(items) {
         sources: item.metadata?.sources || [],
         confidence: item.metadata?.confidence || "medium",
         confidence_score: item.metadata?.confidence_score,
+        answer_status: item.metadata?.answer_status || "supported",
+        citation_count: item.metadata?.citation_count || 0,
+        citation_coverage: item.metadata?.citation_coverage || 0,
       });
       pendingQuestion = null;
     }
@@ -1286,9 +1336,73 @@ function buildChatRecordsFromMessages(items) {
       sources: [],
       confidence: "low",
       confidence_score: null,
+      answer_status: "interrupted",
+      citation_count: 0,
+      citation_coverage: 0,
     });
   }
   return records;
+}
+
+function renderAnswerWithCitations(answer = "", sources = [], onCitationClick) {
+  const sourceByIndex = new Map((sources || []).map((source) => [Number(source.source_index), source]));
+  const parts = String(answer).split(/([\[【][0-9,\s，、-]+[\]】])/g);
+  return parts.map((part, index) => {
+    const citations = extractCitationIndexes(part);
+    if (!citations.length) return <React.Fragment key={`${part}-${index}`}>{part}</React.Fragment>;
+    return (
+      <React.Fragment key={`${part}-${index}`}>
+        {citations.map((citation) => {
+          const source = sourceByIndex.get(citation);
+          return (
+            <Button
+              key={`${part}-${index}-${citation}`}
+              className="citation-button"
+              type="link"
+              size="small"
+              disabled={!source}
+              onClick={() => source && onCitationClick(source)}
+            >
+              [{citation}]
+            </Button>
+          );
+        })}
+      </React.Fragment>
+    );
+  });
+}
+
+function extractCitationIndexes(text = "") {
+  const match = String(text).match(/^[\[【]([0-9,\s，、-]+)[\]】]$/);
+  if (!match) return [];
+  const indexes = [];
+  for (const part of match[1].trim().split(/[,，、\s]+/)) {
+    if (!part) continue;
+    if (part.includes("-")) {
+      const [startText, endText] = part.split("-", 2);
+      const start = Number(startText);
+      const end = Number(endText);
+      if (Number.isInteger(start) && Number.isInteger(end) && start > 0 && end >= start && end <= start + 10) {
+        for (let value = start; value <= end; value += 1) indexes.push(value);
+      }
+    } else {
+      const value = Number(part);
+      if (Number.isInteger(value) && value > 0) indexes.push(value);
+    }
+  }
+  return indexes;
+}
+
+function answerStatusText(value) {
+  const labels = {
+    supported: "引用已验证",
+    no_sources: "无证据",
+    citation_missing: "缺少引用",
+    citation_invalid: "引用无效",
+    citation_incomplete: "引用不完整",
+    interrupted: "未完成",
+  };
+  return labels[value] || value || "引用已验证";
 }
 
 function readError(error) {
