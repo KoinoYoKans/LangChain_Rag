@@ -584,6 +584,7 @@ function DocumentPreview({ api, kbId, file, onClose }) {
 }
 
 function ChatWorkspace({ api }) {
+  const queryClient = useQueryClient();
   const [kbId, setKbId] = useState("");
   const [conversationId, setConversationId] = useState("");
   const [messages, setMessages] = useState([]);
@@ -591,6 +592,11 @@ function ChatWorkspace({ api }) {
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
   const activeKbRecord = (kbs.data || []).find((item) => item.id === kbId);
   const canAsk = Boolean(kbId && (activeKbRecord?.completed_file_count || 0) > 0);
+  const conversations = useQuery({
+    queryKey: ["conversations", kbId],
+    enabled: Boolean(kbId),
+    queryFn: async () => (await api.get("/conversations", { params: { knowledge_base_id: kbId } })).data.items || [],
+  });
   useEffect(() => {
     if (!kbId && kbs.data?.[0]?.id) setKbId(kbs.data[0].id);
   }, [kbs.data, kbId]);
@@ -600,43 +606,134 @@ function ChatWorkspace({ api }) {
       setConversationId(data.conversation_id);
       setMessages((items) => [{ question: values.message, ...data }, ...items]);
       form.resetFields();
+      queryClient.invalidateQueries({ queryKey: ["conversations", kbId] });
     },
     onError: (error) => message.error(readError(error)),
   });
+  const renameConversation = useMutation({
+    mutationFn: ({ id, title }) => api.patch(`/conversations/${id}`, { title }, { params: { knowledge_base_id: kbId } }),
+    onSuccess: () => {
+      message.success("会话已重命名");
+      queryClient.invalidateQueries({ queryKey: ["conversations", kbId] });
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const deleteConversationMutation = useMutation({
+    mutationFn: (id) => api.delete(`/conversations/${id}`, { params: { knowledge_base_id: kbId } }),
+    onSuccess: (_, id) => {
+      if (conversationId === id) startNewConversation();
+      message.success("会话已删除");
+      queryClient.invalidateQueries({ queryKey: ["conversations", kbId] });
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+
+  async function openConversation(item) {
+    try {
+      const { data } = await api.get(`/conversations/${item.id}/messages`, { params: { knowledge_base_id: kbId } });
+      setConversationId(item.id);
+      setMessages(buildChatRecordsFromMessages(data.items || []));
+    } catch (error) {
+      setConversationId("");
+      setMessages([]);
+      message.error(readError(error));
+    }
+  }
+
+  function startNewConversation() {
+    setConversationId("");
+    setMessages([]);
+    form.resetFields();
+  }
+
+  function renameItem(event, item) {
+    event.stopPropagation();
+    let nextTitle = item.title || "";
+    Modal.confirm({
+      title: "重命名会话",
+      content: <Input defaultValue={nextTitle} maxLength={120} onChange={(inputEvent) => { nextTitle = inputEvent.target.value; }} />,
+      okText: "保存",
+      cancelText: "取消",
+      onOk: () => {
+        const title = nextTitle.trim();
+        if (!title) {
+          message.warning("请输入会话名称");
+          return Promise.reject(new Error("empty title"));
+        }
+        return renameConversation.mutateAsync({ id: item.id, title });
+      },
+    });
+  }
+
+  function deleteItem(event, item) {
+    event.stopPropagation();
+    Modal.confirm({
+      title: "删除会话",
+      content: `确认删除“${item.title || "未命名会话"}”？该会话消息也会一起删除。`,
+      okText: "删除",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: () => deleteConversationMutation.mutateAsync(item.id),
+    });
+  }
+
   return (
-    <section className="surface full">
-      <PageTitle title="知识库问答" subtitle="多轮改写、混合检索、重排和引用来源会一起参与回答。" />
-      {activeKbRecord && !canAsk && (
-        <div className="empty-text compact">当前知识库还没有完成入库的文档，请先上传并等待处理完成。</div>
-      )}
-      <Form form={form} layout="inline" className="chat-form" onFinish={(values) => ask.mutate(values)}>
-        <Form.Item className="kb-select">
-          <Select value={kbId} onChange={(value) => { setKbId(value); setConversationId(""); setMessages([]); }} options={(kbs.data || []).map((item) => ({ value: item.id, label: `${item.name} (${item.completed_file_count || 0})` }))} />
-        </Form.Item>
-        <Form.Item name="message" rules={[{ required: true }]} className="grow">
-          <Input.Search placeholder="输入问题" enterButton="发送" loading={ask.isPending} disabled={!canAsk} />
-        </Form.Item>
-      </Form>
-      <div className="answer-list">
-        {messages.map((item) => (
-          <article className="answer-item" key={item.assistant_message_id}>
-            <Typography.Title level={5}>{item.question}</Typography.Title>
-            <Typography.Paragraph>{item.answer}</Typography.Paragraph>
-            <Table
-              rowKey={(row, index) => `${row.chunk_id}-${index}`}
-              size="small"
-              pagination={false}
-              dataSource={item.sources}
-              columns={[
-                { title: "文件", dataIndex: "filename" },
-                { title: "分块", dataIndex: "chunk_index", width: 80 },
-                { title: "页码", dataIndex: "page_number", width: 80, render: (value) => value || "-" },
-                { title: "分数", width: 140, render: (_, row) => scoreText(row.rerank_score ?? row.hybrid_score ?? row.vector_score) },
-                { title: "片段", dataIndex: "snippet" },
-              ]}
-            />
-          </article>
-        ))}
+    <section className="page-grid chat-grid">
+      <div className="surface narrow">
+        <PageTitle title="会话历史" subtitle="按知识库隔离，只展示当前用户自己的会话。" />
+        <Select
+          className="full-select"
+          value={kbId}
+          onChange={(value) => { setKbId(value); startNewConversation(); }}
+          options={(kbs.data || []).map((item) => ({ value: item.id, label: `${item.name} (${item.completed_file_count || 0})` }))}
+        />
+        <Button block className="new-chat-button" onClick={startNewConversation}>新建会话</Button>
+        <div className="kb-list">
+          {(conversations.data || []).map((item) => (
+            <div className={conversationId === item.id ? "conversation-item active" : "conversation-item"} key={item.id} onClick={() => openConversation(item)} role="button" tabIndex={0}>
+              <div>
+                <strong>{item.title || "未命名会话"}</strong>
+                <span>{formatTime(item.updated_at)}</span>
+              </div>
+              <Space size={4}>
+                <Button size="small" type="text" icon={<EditOutlined />} onClick={(event) => renameItem(event, item)} />
+                <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={(event) => deleteItem(event, item)} />
+              </Space>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="surface main">
+        <PageTitle title="知识库问答" subtitle="多轮改写、混合检索、重排和引用来源会一起参与回答。" />
+        {activeKbRecord && !canAsk && (
+          <div className="empty-text compact">当前知识库还没有完成入库的文档，请先上传并等待处理完成。</div>
+        )}
+        <Form form={form} layout="inline" className="chat-form" onFinish={(values) => ask.mutate(values)}>
+          <Form.Item name="message" rules={[{ required: true }]} className="grow">
+            <Input.Search placeholder="输入问题" enterButton="发送" loading={ask.isPending} disabled={!canAsk} />
+          </Form.Item>
+        </Form>
+        <div className="answer-list">
+          {messages.map((item) => (
+            <article className="answer-item" key={item.assistant_message_id || item.user_message_id}>
+              <Typography.Title level={5}>{item.question}</Typography.Title>
+              <Typography.Paragraph>{item.answer}</Typography.Paragraph>
+              <Table
+                rowKey={(row, index) => `${row.chunk_id}-${index}`}
+                size="small"
+                pagination={false}
+                dataSource={item.sources}
+                columns={[
+                  { title: "文件", dataIndex: "filename" },
+                  { title: "分块", dataIndex: "chunk_index", width: 80 },
+                  { title: "页码", dataIndex: "page_number", width: 80, render: (value) => value || "-" },
+                  { title: "分数", width: 140, render: (_, row) => scoreText(row.rerank_score ?? row.hybrid_score ?? row.vector_score) },
+                  { title: "片段", dataIndex: "snippet" },
+                ]}
+              />
+            </article>
+          ))}
+        </div>
       </div>
     </section>
   );
@@ -899,6 +996,39 @@ function buildApi(token) {
 function refreshKnowledge(queryClient, kbId) {
   queryClient.invalidateQueries({ queryKey: ["files", kbId] });
   queryClient.invalidateQueries({ queryKey: ["jobs", kbId] });
+}
+
+function buildChatRecordsFromMessages(items) {
+  const records = [];
+  let pendingQuestion = null;
+  for (const item of items) {
+    if (item.role === "user") {
+      pendingQuestion = item;
+      continue;
+    }
+    if (item.role === "assistant") {
+      records.unshift({
+        conversation_id: item.conversation_id,
+        user_message_id: pendingQuestion?.id || item.id,
+        assistant_message_id: item.id,
+        question: pendingQuestion?.content || "历史问题",
+        answer: item.content,
+        sources: item.metadata?.sources || [],
+      });
+      pendingQuestion = null;
+    }
+  }
+  if (pendingQuestion) {
+    records.unshift({
+      conversation_id: pendingQuestion.conversation_id,
+      user_message_id: pendingQuestion.id,
+      assistant_message_id: "",
+      question: pendingQuestion.content,
+      answer: "该问题尚未生成回答，可能是上次问答中断或失败。",
+      sources: [],
+    });
+  }
+  return records;
 }
 
 function readError(error) {

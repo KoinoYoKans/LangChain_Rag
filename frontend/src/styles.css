@@ -74,6 +74,10 @@ body {
   gap: 18px;
 }
 
+.chat-grid {
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+}
+
 .surface {
   min-width: 0;
   border: 1px solid #d8e0ec;
@@ -126,6 +130,49 @@ body {
 }
 
 .kb-item span {
+  color: #69788e;
+  font-size: 12px;
+}
+
+.full-select,
+.new-chat-button {
+  width: 100%;
+}
+
+.new-chat-button {
+  margin-top: 10px;
+}
+
+.conversation-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 64px;
+  border: 1px solid #dce3ee;
+  border-radius: 8px;
+  background: #f9fbfd;
+  padding: 10px 10px 10px 12px;
+  color: #172033;
+  cursor: pointer;
+}
+
+.conversation-item.active {
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+
+.conversation-item strong,
+.conversation-item span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-item span {
+  margin-top: 4px;
   color: #69788e;
   font-size: 12px;
 }

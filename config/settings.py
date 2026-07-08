@@ -61,6 +61,8 @@ class AppSettings:
     openai_api_key: str | None
     openai_base_url: str | None
     openai_model: str
+    openai_timeout_seconds: int
+    openai_max_retries: int
     default_model_agent_name: str
     dashscope_api_key: str | None
     embedding_provider: str
@@ -87,6 +89,8 @@ class AppSettings:
     chat_history_limit: int
     rag_top_k: int
     rerank_top_n: int
+    retrieval_timeout_seconds: int
+    rerank_timeout_seconds: int
     chunk_size: int
     chunk_overlap: int
 
@@ -109,6 +113,8 @@ class AppSettings:
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_base_url=os.getenv("OPENAI_BASE_URL"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
+            openai_timeout_seconds=_as_int("OPENAI_TIMEOUT_SECONDS", 45),
+            openai_max_retries=_as_int("OPENAI_MAX_RETRIES", 1),
             default_model_agent_name=os.getenv("DEFAULT_MODEL_AGENT_NAME", "default"),
             dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"),
             embedding_provider=os.getenv("EMBEDDING_PROVIDER", "local").lower(),
@@ -141,6 +147,8 @@ class AppSettings:
             chat_history_limit=_as_int("CHAT_HISTORY_LIMIT", 10),
             rag_top_k=_as_int("RAG_TOP_K", 8),
             rerank_top_n=_as_int("RERANK_TOP_N", 4),
+            retrieval_timeout_seconds=_as_int("RETRIEVAL_TIMEOUT_SECONDS", 30),
+            rerank_timeout_seconds=_as_int("RERANK_TIMEOUT_SECONDS", 30),
             chunk_size=_as_int("CHUNK_SIZE", 1000),
             chunk_overlap=_as_int("CHUNK_OVERLAP", 150),
         )
@@ -153,6 +161,10 @@ class AppSettings:
             errors.append("OPENAI_BASE_URL is required for the OpenAI-compatible chat API")
         if not self.openai_model:
             errors.append("OPENAI_MODEL is required")
+        if self.openai_timeout_seconds <= 0:
+            errors.append("OPENAI_TIMEOUT_SECONDS must be greater than 0")
+        if self.openai_max_retries < 0:
+            errors.append("OPENAI_MAX_RETRIES must be greater than or equal to 0")
         if not self.postgres_dsn:
             errors.append("POSTGRES_DSN is required for pgvector persistence")
         if not self.redis_url:
@@ -173,6 +185,10 @@ class AppSettings:
             errors.append("CHAT_HISTORY_LIMIT must be greater than or equal to 0")
         if self.rerank_top_n < 0:
             errors.append("RERANK_TOP_N must be greater than or equal to 0")
+        if self.retrieval_timeout_seconds <= 0:
+            errors.append("RETRIEVAL_TIMEOUT_SECONDS must be greater than 0")
+        if self.rerank_timeout_seconds <= 0:
+            errors.append("RERANK_TIMEOUT_SECONDS must be greater than 0")
         if self.chunk_size <= self.chunk_overlap:
             errors.append("CHUNK_SIZE must be greater than CHUNK_OVERLAP")
         if self.embedding_provider != "local":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from math import log
 from uuid import UUID
@@ -27,7 +28,8 @@ async def hybrid_search(
     user_id: str,
     knowledge_base_id: str,
 ) -> RetrievalResult:
-    vector_docs = similarity_search(
+    vector_docs = await asyncio.to_thread(
+        similarity_search,
         vector_store,
         query,
         top_k=max(top_k * 2, top_k),

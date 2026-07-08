@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse
@@ -20,9 +21,13 @@ from core.api_key_store import ApiKey, create_api_key, list_api_keys, verify_api
 from core.conversation_store import (
     Conversation,
     add_message,
+    delete_conversation,
     ensure_conversation,
+    get_conversation,
+    list_conversation_messages,
     get_recent_messages,
     list_conversations,
+    update_conversation_title,
 )
 from core.document_loader import (
     SUPPORTED_EXTENSIONS,
@@ -170,6 +175,7 @@ class DeleteDocumentResponse(BaseModel):
 class ConversationResponse(BaseModel):
     id: str
     user_id: str
+    knowledge_base_id: str | None = None
     title: str | None
     created_at: str
     updated_at: str
@@ -177,6 +183,29 @@ class ConversationResponse(BaseModel):
 
 class ConversationListResponse(BaseModel):
     items: list[ConversationResponse]
+
+
+class ConversationUpdateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=120)
+
+
+class DeleteConversationResponse(BaseModel):
+    conversation_id: str
+    deleted: bool
+
+
+class ChatMessageResponse(BaseModel):
+    id: str
+    conversation_id: str
+    knowledge_base_id: str | None = None
+    role: str
+    content: str
+    metadata: dict[str, Any]
+    created_at: str
+
+
+class ChatMessageListResponse(BaseModel):
+    items: list[ChatMessageResponse]
 
 
 class LoginRequest(BaseModel):
@@ -438,6 +467,9 @@ def create_app() -> FastAPI:
                 "rag_top_k": state.settings.rag_top_k,
                 "rerank_top_n": state.settings.rerank_top_n,
                 "chat_history_limit": state.settings.chat_history_limit,
+                "openai_timeout_seconds": state.settings.openai_timeout_seconds,
+                "retrieval_timeout_seconds": state.settings.retrieval_timeout_seconds,
+                "rerank_timeout_seconds": state.settings.rerank_timeout_seconds,
             },
         }
 
@@ -1290,17 +1322,126 @@ def create_app() -> FastAPI:
 
     @app.get("/conversations", response_model=ConversationListResponse)
     async def conversations(
-        user_id: str = Query(..., min_length=1),
+        knowledge_base_id: str = Query(..., min_length=1),
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
+        current_user: CurrentUser = Depends(require_current_user),
     ) -> ConversationListResponse:
         state = require_ready(app)
+        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
         return ConversationListResponse(
             items=[
                 conversation_response(item)
-                for item in await list_conversations(state.settings, user_id=user_id, limit=limit, offset=offset)
+                for item in await list_conversations(
+                    state.settings,
+                    user_id=current_user.id,
+                    knowledge_base_id=knowledge_base_id,
+                    limit=limit,
+                    offset=offset,
+                )
             ]
         )
+
+    @app.get("/conversations/{conversation_id}/messages", response_model=ChatMessageListResponse)
+    async def conversation_messages(
+        conversation_id: UUID,
+        knowledge_base_id: UUID = Query(...),
+        limit: int = Query(default=200, ge=1, le=500),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> ChatMessageListResponse:
+        state = require_ready(app)
+        conversation_id_text = str(conversation_id)
+        knowledge_base_id_text = str(knowledge_base_id)
+        await require_knowledge_base_access(state.settings, knowledge_base_id_text, current_user)
+        conversation = await get_conversation(
+            state.settings,
+            conversation_id=conversation_id_text,
+            user_id=current_user.id,
+            knowledge_base_id=knowledge_base_id_text,
+        )
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        return ChatMessageListResponse(
+            items=[
+                chat_message_response(item)
+                for item in await list_conversation_messages(
+                    state.settings,
+                    conversation_id=conversation_id_text,
+                    user_id=current_user.id,
+                    knowledge_base_id=knowledge_base_id_text,
+                    limit=limit,
+                )
+            ]
+        )
+
+    @app.patch("/conversations/{conversation_id}", response_model=ConversationResponse)
+    async def update_conversation_endpoint(
+        http_request: Request,
+        conversation_id: UUID,
+        request: ConversationUpdateRequest,
+        knowledge_base_id: UUID = Query(...),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> ConversationResponse:
+        state = require_ready(app)
+        conversation_id_text = str(conversation_id)
+        knowledge_base_id_text = str(knowledge_base_id)
+        await require_knowledge_base_access(state.settings, knowledge_base_id_text, current_user)
+        title = request.title.strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="Conversation title is required")
+        conversation = await update_conversation_title(
+            state.settings,
+            conversation_id=conversation_id_text,
+            user_id=current_user.id,
+            knowledge_base_id=knowledge_base_id_text,
+            title=title,
+        )
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="conversation.update",
+            target_type="conversation",
+            target_id=conversation_id_text,
+            metadata={"knowledge_base_id": knowledge_base_id_text, "title": conversation.title},
+            **audit_context(http_request),
+        )
+        return conversation_response(conversation)
+
+    @app.delete("/conversations/{conversation_id}", response_model=DeleteConversationResponse)
+    async def delete_conversation_endpoint(
+        http_request: Request,
+        conversation_id: UUID,
+        knowledge_base_id: UUID = Query(...),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> DeleteConversationResponse:
+        state = require_ready(app)
+        conversation_id_text = str(conversation_id)
+        knowledge_base_id_text = str(knowledge_base_id)
+        await require_knowledge_base_access(state.settings, knowledge_base_id_text, current_user)
+        deleted = await delete_conversation(
+            state.settings,
+            conversation_id=conversation_id_text,
+            user_id=current_user.id,
+            knowledge_base_id=knowledge_base_id_text,
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="conversation.delete",
+            target_type="conversation",
+            target_id=conversation_id_text,
+            metadata={"knowledge_base_id": knowledge_base_id_text},
+            **audit_context(http_request),
+        )
+        return DeleteConversationResponse(conversation_id=conversation_id_text, deleted=True)
 
     @app.post("/chat", response_model=ChatResponse)
     async def chat(
@@ -1317,24 +1458,36 @@ def create_app() -> FastAPI:
             )
         top_k = request.top_k or state.settings.rag_top_k
         rerank_top_n = request.rerank_top_n if request.rerank_top_n is not None else state.settings.rerank_top_n
-        conversation_id = request.conversation_id or str(uuid4())
+        try:
+            conversation_id = str(UUID(request.conversation_id)) if request.conversation_id else str(uuid4())
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid conversation_id") from exc
         started_at = time.perf_counter()
         try:
-            await ensure_conversation(
-                state.settings,
-                conversation_id=conversation_id,
-                org_id=current_user.org_id,
-                knowledge_base_id=request.knowledge_base_id,
-                user_id=current_user.id,
-                title=request.message[:80],
-            )
+            try:
+                await ensure_conversation(
+                    state.settings,
+                    conversation_id=conversation_id,
+                    org_id=current_user.org_id,
+                    knowledge_base_id=request.knowledge_base_id,
+                    user_id=current_user.id,
+                    title=request.message[:80],
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=403, detail="Conversation is not available in this knowledge base") from exc
             history = await get_recent_messages(
                 state.settings,
                 conversation_id=conversation_id,
                 user_id=current_user.id,
                 limit=state.settings.chat_history_limit,
+                knowledge_base_id=request.knowledge_base_id,
             )
-            retrieval_query = rewrite_query(state.chat_model, request.message, history)
+            retrieval_query = await rewrite_query_async(
+                state.chat_model,
+                request.message,
+                history,
+                state.settings.openai_timeout_seconds,
+            )
             user_message = await add_message(
                 state.settings,
                 message_id=str(uuid4()),
@@ -1345,18 +1498,27 @@ def create_app() -> FastAPI:
                 role="user",
                 content=request.message,
             )
-            retrieval = await hybrid_search(
-                state.settings,
-                state.vector_store,
-                retrieval_query,
-                user_id=current_user.id,
-                knowledge_base_id=request.knowledge_base_id,
-                top_k=top_k,
+            retrieval = await asyncio.wait_for(
+                hybrid_search(
+                    state.settings,
+                    state.vector_store,
+                    retrieval_query,
+                    user_id=current_user.id,
+                    knowledge_base_id=request.knowledge_base_id,
+                    top_k=top_k,
+                ),
+                timeout=state.settings.retrieval_timeout_seconds,
             )
             if not retrieval.documents:
                 ranked_documents = []
             else:
-                ranked_documents = rerank_or_original(state.reranker, retrieval_query, retrieval.documents, rerank_top_n)
+                ranked_documents = await rerank_or_original_async(
+                    state.reranker,
+                    retrieval_query,
+                    retrieval.documents,
+                    rerank_top_n,
+                    state.settings.rerank_timeout_seconds,
+                )
             selected = ranked_documents[: rerank_top_n or len(ranked_documents)]
             if selected:
                 context = format_context([item.document for item in selected])
@@ -1367,7 +1529,11 @@ def create_app() -> FastAPI:
                         "history": format_history(history),
                     }
                 )
-                answer = state.chat_model.invoke(prompt).content
+                answer = (await invoke_chat_model(
+                    state.chat_model,
+                    prompt,
+                    state.settings.openai_timeout_seconds,
+                )).content
             else:
                 answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
             sources = [
@@ -1415,6 +1581,24 @@ def create_app() -> FastAPI:
             )
         except HTTPException:
             raise
+        except asyncio.TimeoutError as exc:
+            await add_audit_log(
+                state.settings,
+                org_id=current_user.org_id,
+                actor_user_id=current_user.id,
+                actor_department_id=current_user.department_id,
+                action="chat.ask",
+                target_type="knowledge_base",
+                target_id=request.knowledge_base_id,
+                result="failed",
+                error_message="Chat model request timed out",
+                metadata={"conversation_id": conversation_id, "query": request.message},
+                **audit_context(http_request),
+            )
+            raise HTTPException(
+                status_code=504,
+                detail={"message": "模型响应超时，请稍后重试或检查模型服务。", "stage": "chat"},
+            ) from exc
         except Exception as exc:  # noqa: BLE001
             await add_audit_log(
                 state.settings,
@@ -1482,16 +1666,30 @@ def create_app() -> FastAPI:
         if not question:
             raise HTTPException(status_code=400, detail="At least one user message is required")
         top_k = request.top_k or state.settings.rag_top_k
-        retrieval_query = rewrite_query(state.chat_model, question, request.messages[:-1])
-        retrieval = await hybrid_search(
-            state.settings,
-            state.vector_store,
-            retrieval_query,
-            top_k=top_k,
-            user_id=api_key.user_id,
-            knowledge_base_id=api_key.knowledge_base_id,
+        retrieval_query = await rewrite_query_async(
+            state.chat_model,
+            question,
+            request.messages[:-1],
+            state.settings.openai_timeout_seconds,
         )
-        ranked_documents = rerank_or_original(state.reranker, retrieval_query, retrieval.documents, state.settings.rerank_top_n)
+        retrieval = await asyncio.wait_for(
+            hybrid_search(
+                state.settings,
+                state.vector_store,
+                retrieval_query,
+                top_k=top_k,
+                user_id=api_key.user_id,
+                knowledge_base_id=api_key.knowledge_base_id,
+            ),
+            timeout=state.settings.retrieval_timeout_seconds,
+        )
+        ranked_documents = await rerank_or_original_async(
+            state.reranker,
+            retrieval_query,
+            retrieval.documents,
+            state.settings.rerank_top_n,
+            state.settings.rerank_timeout_seconds,
+        )
         selected = ranked_documents[: state.settings.rerank_top_n or len(ranked_documents)]
         if selected:
             prompt = build_prompt().invoke(
@@ -1501,7 +1699,11 @@ def create_app() -> FastAPI:
                     "history": "\n".join(f"{item.role}: {item.content}" for item in request.messages[:-1]) or "No prior messages.",
                 }
             )
-            answer = str(state.chat_model.invoke(prompt).content)
+            answer = str((await invoke_chat_model(
+                state.chat_model,
+                prompt,
+                state.settings.openai_timeout_seconds,
+            )).content)
         else:
             answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
         sources = [source_from_document(item.document, item.score).model_dump() for item in selected]
@@ -1864,6 +2066,22 @@ def rerank_or_original(
         return [RerankedDocument(document=document, score=None) for document in documents[:top_n]]
 
 
+async def rerank_or_original_async(
+    reranker: Reranker,
+    query: str,
+    documents: list[Document],
+    top_n: int,
+    timeout_seconds: int,
+) -> list[RerankedDocument]:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(rerank_or_original, reranker, query, documents, top_n),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        return [RerankedDocument(document=document, score=None) for document in documents[:top_n]]
+
+
 def rewrite_query(chat_model: Any, question: str, history: list[Any]) -> str:
     if not history:
         return question
@@ -1884,13 +2102,50 @@ def rewrite_query(chat_model: Any, question: str, history: list[Any]) -> str:
         return question
 
 
+async def rewrite_query_async(chat_model: Any, question: str, history: list[Any], timeout_seconds: int) -> str:
+    if not history:
+        return question
+    try:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "Rewrite the latest user question into a standalone retrieval query. "
+                    "Keep names, entities, dates, and the user's language. Return only the query.",
+                ),
+                ("human", "History:\n{history}\n\nLatest question:\n{question}"),
+            ]
+        ).invoke({"history": format_history(history), "question": question})
+        rewritten = str((await invoke_chat_model(chat_model, prompt, timeout_seconds)).content).strip()
+        return rewritten or question
+    except Exception:  # noqa: BLE001
+        return question
+
+
+async def invoke_chat_model(chat_model: Any, prompt: Any, timeout_seconds: int) -> Any:
+    return await asyncio.wait_for(chat_model.ainvoke(prompt), timeout=timeout_seconds)
+
+
 def conversation_response(conversation: Conversation) -> ConversationResponse:
     return ConversationResponse(
         id=conversation.id,
         user_id=conversation.user_id,
+        knowledge_base_id=conversation.knowledge_base_id,
         title=conversation.title,
         created_at=conversation.created_at.isoformat(),
         updated_at=conversation.updated_at.isoformat(),
+    )
+
+
+def chat_message_response(message: Any) -> ChatMessageResponse:
+    return ChatMessageResponse(
+        id=message.id,
+        conversation_id=message.conversation_id,
+        knowledge_base_id=message.knowledge_base_id,
+        role=message.role,
+        content=message.content,
+        metadata=message.metadata,
+        created_at=message.created_at.isoformat(),
     )
 
 
