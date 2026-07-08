@@ -84,6 +84,10 @@ class KnowledgeBaseModel(Base):
     description: Mapped[str | None] = mapped_column(Text)
     visibility: Mapped[str] = mapped_column(String, nullable=False, default="department")
     department_ids: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False, default=list)
+    retrieval_top_k: Mapped[int | None] = mapped_column(Integer)
+    rerank_top_n: Mapped[int | None] = mapped_column(Integer)
+    low_confidence_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.35)
+    low_confidence_max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -185,6 +189,10 @@ class ChatLogModel(Base):
     answer_status: Mapped[str | None] = mapped_column(Text)
     confidence: Mapped[str | None] = mapped_column(Text)
     confidence_score: Mapped[float | None] = mapped_column(Float)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_trace: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    auto_retry_triggered: Mapped[bool] = mapped_column(nullable=False, default=False)
+    final_low_confidence: Mapped[bool] = mapped_column(nullable=False, default=False)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -411,6 +419,14 @@ async def _migrate_existing_tables(connection: Any, settings: AppSettings) -> No
 
     await connection.execute(text('alter table "rag_knowledge_bases" add column if not exists status text not null default \'active\''))
     await connection.execute(text('alter table "rag_knowledge_bases" add column if not exists deleted_at timestamp with time zone'))
+    kb_columns = {
+        "retrieval_top_k": "integer",
+        "rerank_top_n": "integer",
+        "low_confidence_threshold": "double precision not null default 0.35",
+        "low_confidence_max_retries": "integer not null default 1",
+    }
+    for column, column_type in kb_columns.items():
+        await connection.execute(text(f'alter table "rag_knowledge_bases" add column if not exists {column} {column_type}'))
     await connection.execute(text('drop index if exists "rag_knowledge_bases_org_name_uidx"'))
     await connection.execute(
         text(
@@ -451,6 +467,10 @@ async def _migrate_existing_tables(connection: Any, settings: AppSettings) -> No
         "answer_status": "text",
         "confidence": "text",
         "confidence_score": "double precision",
+        "retry_count": "integer not null default 0",
+        "retry_trace": "jsonb not null default '[]'::jsonb",
+        "auto_retry_triggered": "boolean not null default false",
+        "final_low_confidence": "boolean not null default false",
     }
     for column, column_type in chat_log_columns.items():
         await connection.execute(text(f'alter table "{chat_log_table}" add column if not exists {column} {column_type}'))

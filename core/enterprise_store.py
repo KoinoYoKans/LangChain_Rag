@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from config.database import (
@@ -68,6 +68,10 @@ class KnowledgeBase:
     description: str | None
     visibility: str
     department_ids: list[str]
+    retrieval_top_k: int | None
+    rerank_top_n: int | None
+    low_confidence_threshold: float
+    low_confidence_max_retries: int
     status: str
     created_at: datetime
     updated_at: datetime
@@ -315,6 +319,10 @@ async def create_knowledge_base(
     description: str | None,
     visibility: str,
     department_ids: list[str],
+    retrieval_top_k: int | None = None,
+    rerank_top_n: int | None = None,
+    low_confidence_threshold: float = 0.35,
+    low_confidence_max_retries: int = 1,
 ) -> KnowledgeBase:
     kb = KnowledgeBaseModel(
         id=uuid4(),
@@ -324,6 +332,10 @@ async def create_knowledge_base(
         description=description,
         visibility=visibility,
         department_ids=department_ids,
+        retrieval_top_k=retrieval_top_k,
+        rerank_top_n=rerank_top_n,
+        low_confidence_threshold=low_confidence_threshold,
+        low_confidence_max_retries=low_confidence_max_retries,
         status="active",
     )
     member = KnowledgeBaseMemberModel(id=uuid4(), knowledge_base_id=kb.id, user_id=UUID(user.id), role="owner")
@@ -352,6 +364,10 @@ async def update_knowledge_base(
     description: str | None,
     visibility: str,
     department_ids: list[str],
+    retrieval_top_k: int | None = None,
+    rerank_top_n: int | None = None,
+    low_confidence_threshold: float = 0.35,
+    low_confidence_max_retries: int = 1,
 ) -> KnowledgeBase:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
@@ -369,6 +385,10 @@ async def update_knowledge_base(
             kb.description = description
             kb.visibility = visibility
             kb.department_ids = department_ids
+            kb.retrieval_top_k = retrieval_top_k
+            kb.rerank_top_n = rerank_top_n
+            kb.low_confidence_threshold = low_confidence_threshold
+            kb.low_confidence_max_retries = low_confidence_max_retries
         await session.refresh(kb)
         return _kb_to_dataclass(kb)
 
@@ -657,6 +677,10 @@ async def add_chat_log(
     answer_status: str | None = None,
     confidence: str | None = None,
     confidence_score: float | None = None,
+    retry_count: int = 0,
+    retry_trace: list[dict[str, Any]] | None = None,
+    auto_retry_triggered: bool = False,
+    final_low_confidence: bool = False,
 ) -> None:
     row = ChatLogModel(
         id=uuid4(),
@@ -680,6 +704,10 @@ async def add_chat_log(
         answer_status=answer_status,
         confidence=confidence,
         confidence_score=confidence_score,
+        retry_count=retry_count,
+        retry_trace=retry_trace or [],
+        auto_retry_triggered=auto_retry_triggered,
+        final_low_confidence=final_low_confidence,
         latency_ms=latency_ms,
     )
     session_maker = build_async_session_maker(settings)
@@ -716,7 +744,7 @@ async def list_chat_operations(
     if answer_status:
         conditions.append(ChatLogModel.answer_status == answer_status)
     if low_confidence:
-        conditions.append(ChatLogModel.confidence == "low")
+        conditions.append(or_(ChatLogModel.confidence == "low", ChatLogModel.final_low_confidence.is_(True)))
     if no_citations:
         conditions.append(ChatLogModel.citation_count == 0)
     join_condition = and_(
@@ -767,6 +795,10 @@ def chat_operation_to_dict(chat_log: ChatLogModel, feedback: FeedbackModel | Non
         "answer_status": chat_log.answer_status,
         "confidence": chat_log.confidence,
         "confidence_score": float(chat_log.confidence_score) if chat_log.confidence_score is not None else None,
+        "retry_count": int(chat_log.retry_count or 0),
+        "retry_trace": list(chat_log.retry_trace or []),
+        "auto_retry_triggered": bool(chat_log.auto_retry_triggered),
+        "final_low_confidence": bool(chat_log.final_low_confidence),
         "model_name": chat_log.model_name,
         "latency_ms": chat_log.latency_ms,
         "prompt_tokens": chat_log.prompt_tokens,
@@ -879,6 +911,14 @@ def _kb_to_dataclass(model: KnowledgeBaseModel) -> KnowledgeBase:
         description=model.description,
         visibility=model.visibility,
         department_ids=list(model.department_ids or []),
+        retrieval_top_k=model.retrieval_top_k,
+        rerank_top_n=model.rerank_top_n,
+        low_confidence_threshold=float(
+            model.low_confidence_threshold
+            if model.low_confidence_threshold is not None
+            else 0.35
+        ),
+        low_confidence_max_retries=int(model.low_confidence_max_retries or 0),
         status=model.status,
         created_at=model.created_at,
         updated_at=model.updated_at,

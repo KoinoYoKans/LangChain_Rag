@@ -54,6 +54,7 @@ from core.enterprise_store import (
     create_knowledge_base,
     create_user,
     deactivate_user,
+    get_knowledge_base,
     get_user_by_id,
     get_knowledge_base_capabilities,
     get_knowledge_base_stats,
@@ -129,6 +130,9 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
     top_k: int | None = Field(default=None, ge=1, le=50)
     rerank_top_n: int | None = Field(default=None, ge=0, le=50)
+    score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    low_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_retries: int | None = Field(default=None, ge=0, le=3)
 
 
 class Source(BaseModel):
@@ -162,6 +166,10 @@ class ChatResponse(BaseModel):
     answer_status: str = "supported"
     citation_count: int = 0
     citation_coverage: float = 0.0
+    retry_count: int = 0
+    retry_trace: list[dict[str, Any]] = Field(default_factory=list)
+    auto_retry_triggered: bool = False
+    final_low_confidence: bool = False
 
 
 class FeedbackRequest(BaseModel):
@@ -213,6 +221,10 @@ class ChatOperationResponse(BaseModel):
     answer_status: str | None = None
     confidence: str | None = None
     confidence_score: float | None = None
+    retry_count: int = 0
+    retry_trace: list[dict[str, Any]] = Field(default_factory=list)
+    auto_retry_triggered: bool = False
+    final_low_confidence: bool = False
     model_name: str | None = None
     latency_ms: int | None = None
     prompt_tokens: int | None = None
@@ -367,6 +379,10 @@ class KnowledgeBaseCreateRequest(BaseModel):
     description: str | None = None
     visibility: str = Field(default="department", pattern="^(private|department|org)$")
     department_ids: list[str] = Field(default_factory=list)
+    retrieval_top_k: int | None = Field(default=None, ge=1, le=50)
+    rerank_top_n: int | None = Field(default=None, ge=0, le=50)
+    low_confidence_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    low_confidence_max_retries: int = Field(default=1, ge=0, le=3)
 
 
 class KnowledgeBaseUpdateRequest(BaseModel):
@@ -374,6 +390,10 @@ class KnowledgeBaseUpdateRequest(BaseModel):
     description: str | None = None
     visibility: str = Field(default="department", pattern="^(private|department|org)$")
     department_ids: list[str] = Field(default_factory=list)
+    retrieval_top_k: int | None = Field(default=None, ge=1, le=50)
+    rerank_top_n: int | None = Field(default=None, ge=0, le=50)
+    low_confidence_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    low_confidence_max_retries: int = Field(default=1, ge=0, le=3)
 
 
 class KnowledgeBaseResponse(BaseModel):
@@ -384,6 +404,10 @@ class KnowledgeBaseResponse(BaseModel):
     description: str | None
     visibility: str
     department_ids: list[str]
+    retrieval_top_k: int | None = None
+    rerank_top_n: int | None = None
+    low_confidence_threshold: float = 0.35
+    low_confidence_max_retries: int = 1
     status: str = "active"
     file_count: int = 0
     completed_file_count: int = 0
@@ -589,6 +613,10 @@ class OpenAIChatCompletionRequest(BaseModel):
     temperature: float | None = None
     stream: bool = False
     top_k: int | None = Field(default=None, ge=1, le=50)
+    rerank_top_n: int | None = Field(default=None, ge=0, le=50)
+    score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    low_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_retries: int | None = Field(default=None, ge=0, le=3)
     conversation_id: str | None = None
 
 
@@ -916,6 +944,10 @@ def create_app() -> FastAPI:
             description=request.description,
             visibility=request.visibility,
             department_ids=request.department_ids or ([current_user.department_id] if current_user.department_id else []),
+            retrieval_top_k=request.retrieval_top_k,
+            rerank_top_n=request.rerank_top_n,
+            low_confidence_threshold=request.low_confidence_threshold,
+            low_confidence_max_retries=request.low_confidence_max_retries,
         )
         await add_audit_log(
             settings,
@@ -925,7 +957,15 @@ def create_app() -> FastAPI:
             action="knowledge_base.create",
             target_type="knowledge_base",
             target_id=kb.id,
-            metadata={"name": kb.name, "visibility": kb.visibility, "department_ids": kb.department_ids},
+            metadata={
+                "name": kb.name,
+                "visibility": kb.visibility,
+                "department_ids": kb.department_ids,
+                "retrieval_top_k": kb.retrieval_top_k,
+                "rerank_top_n": kb.rerank_top_n,
+                "low_confidence_threshold": kb.low_confidence_threshold,
+                "low_confidence_max_retries": kb.low_confidence_max_retries,
+            },
             **audit_context(http_request),
         )
         return kb_response(
@@ -951,6 +991,10 @@ def create_app() -> FastAPI:
             description=request.description,
             visibility=request.visibility,
             department_ids=request.department_ids or ([current_user.department_id] if current_user.department_id else []),
+            retrieval_top_k=request.retrieval_top_k,
+            rerank_top_n=request.rerank_top_n,
+            low_confidence_threshold=request.low_confidence_threshold,
+            low_confidence_max_retries=request.low_confidence_max_retries,
         )
         await add_audit_log(
             settings,
@@ -960,7 +1004,15 @@ def create_app() -> FastAPI:
             action="knowledge_base.update",
             target_type="knowledge_base",
             target_id=kb.id,
-            metadata={"name": kb.name, "visibility": kb.visibility, "department_ids": kb.department_ids},
+            metadata={
+                "name": kb.name,
+                "visibility": kb.visibility,
+                "department_ids": kb.department_ids,
+                "retrieval_top_k": kb.retrieval_top_k,
+                "rerank_top_n": kb.rerank_top_n,
+                "low_confidence_threshold": kb.low_confidence_threshold,
+                "low_confidence_max_retries": kb.low_confidence_max_retries,
+            },
             **audit_context(http_request),
         )
         return kb_response(
@@ -2012,14 +2064,24 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> ChatResponse:
         state = require_ready(app)
-        await require_knowledge_base_access(state.settings, request.knowledge_base_id, current_user)
+        kb = await require_knowledge_base_access(state.settings, request.knowledge_base_id, current_user)
         if await count_completed_knowledge_base_files(state.settings, request.knowledge_base_id) <= 0:
             raise HTTPException(
                 status_code=409,
                 detail={"message": "该知识库还没有完成入库的文档，请先上传并等待处理完成。", "stage": "documents"},
             )
-        top_k = request.top_k or state.settings.rag_top_k
-        rerank_top_n = request.rerank_top_n if request.rerank_top_n is not None else state.settings.rerank_top_n
+        top_k = request.top_k or kb.retrieval_top_k or state.settings.rag_top_k
+        rerank_top_n = (
+            request.rerank_top_n
+            if request.rerank_top_n is not None
+            else kb.rerank_top_n
+            if kb.rerank_top_n is not None
+            else state.settings.rerank_top_n
+        )
+        low_confidence_threshold = request.low_confidence_threshold
+        if low_confidence_threshold is None:
+            low_confidence_threshold = kb.low_confidence_threshold
+        max_retries = request.max_retries if request.max_retries is not None else kb.low_confidence_max_retries
         try:
             conversation_id = str(UUID(request.conversation_id)) if request.conversation_id else str(uuid4())
         except ValueError as exc:
@@ -2045,12 +2107,6 @@ def create_app() -> FastAPI:
                 limit=state.settings.chat_history_limit,
                 knowledge_base_id=request.knowledge_base_id,
             )
-            retrieval_query = await rewrite_query_async(
-                state.chat_model,
-                request.message,
-                history,
-                state.settings.openai_timeout_seconds,
-            )
             user_message = await add_message(
                 state.settings,
                 message_id=str(uuid4()),
@@ -2061,55 +2117,29 @@ def create_app() -> FastAPI:
                 role="user",
                 content=request.message,
             )
-            retrieval = await asyncio.wait_for(
-                hybrid_search(
-                    state.settings,
-                    state.vector_store,
-                    retrieval_query,
-                    user_id=current_user.id,
-                    knowledge_base_id=request.knowledge_base_id,
-                    top_k=top_k,
-                ),
-                timeout=state.settings.retrieval_timeout_seconds,
+            attempt_result = await run_cited_answer_attempts(
+                state,
+                question=request.message,
+                history=history,
+                history_text=format_history(history),
+                user_id=current_user.id,
+                knowledge_base_id=request.knowledge_base_id,
+                top_k=top_k,
+                rerank_top_n=rerank_top_n,
+                low_confidence_threshold=low_confidence_threshold,
+                max_retries=max_retries,
+                score_threshold=request.score_threshold,
             )
-            if not retrieval.documents:
-                ranked_documents = []
-            else:
-                ranked_documents = await rerank_or_original_async(
-                    state.reranker,
-                    retrieval_query,
-                    retrieval.documents,
-                    rerank_top_n,
-                    state.settings.rerank_timeout_seconds,
-                )
-            selected = ranked_documents[: rerank_top_n or len(ranked_documents)]
-            if selected:
-                context = format_context([item.document for item in selected])
-                prompt = build_prompt().invoke(
-                    {
-                        "question": request.message,
-                        "context": context,
-                        "history": format_history(history),
-                    }
-                )
-                answer = (await invoke_chat_model(
-                    state.chat_model,
-                    prompt,
-                    state.settings.openai_timeout_seconds,
-                )).content
-            else:
-                answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
-            sources = [
-                source_from_document(item.document, rerank_score=item.score, source_index=index)
-                for index, item in enumerate(selected, start=1)
-            ]
-            citation_result = evaluate_citations(str(answer), sources)
-            if citation_result["answer_status"] != "supported":
-                answer = insufficient_evidence_answer(citation_result["answer_status"])
-                confidence = "low"
-                confidence_score = citation_result["citation_coverage"]
-            else:
-                confidence, confidence_score = answer_confidence(sources)
+            answer = str(attempt_result["answer"])
+            sources = attempt_result["sources"]
+            citation_result = attempt_result["citation_result"]
+            confidence = attempt_result["confidence"]
+            confidence_score = attempt_result["confidence_score"]
+            retry_trace = attempt_result["retry_trace"]
+            retry_count = int(attempt_result["retry_count"])
+            auto_retry_triggered = bool(attempt_result["auto_retry_triggered"])
+            final_low_confidence = bool(attempt_result["final_low_confidence"])
+            retrieval_query = str(attempt_result["retrieval_query"])
             assistant_message = await add_message(
                 state.settings,
                 message_id=str(uuid4()),
@@ -2126,6 +2156,10 @@ def create_app() -> FastAPI:
                     "answer_status": citation_result["answer_status"],
                     "citation_count": citation_result["citation_count"],
                     "citation_coverage": citation_result["citation_coverage"],
+                    "retry_count": retry_count,
+                    "retry_trace": retry_trace,
+                    "auto_retry_triggered": auto_retry_triggered,
+                    "final_low_confidence": final_low_confidence,
                 },
             )
             await add_chat_log(
@@ -2148,6 +2182,10 @@ def create_app() -> FastAPI:
                 answer_status=str(citation_result["answer_status"]),
                 confidence=confidence,
                 confidence_score=confidence_score,
+                retry_count=retry_count,
+                retry_trace=retry_trace,
+                auto_retry_triggered=auto_retry_triggered,
+                final_low_confidence=final_low_confidence,
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
             )
             await add_audit_log(
@@ -2165,6 +2203,13 @@ def create_app() -> FastAPI:
                     "answer_status": citation_result["answer_status"],
                     "query": request.message,
                     "retrieval_query": retrieval_query,
+                    "low_confidence_threshold": low_confidence_threshold,
+                    "score_threshold": request.score_threshold,
+                    "max_retries": max_retries,
+                    "retry_count": retry_count,
+                    "auto_retry_triggered": auto_retry_triggered,
+                    "final_low_confidence": final_low_confidence,
+                    "retry_trace": retry_trace,
                 },
                 actor_department_id=current_user.department_id,
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
@@ -2217,6 +2262,10 @@ def create_app() -> FastAPI:
             answer_status=str(citation_result["answer_status"]),
             citation_count=int(citation_result["citation_count"]),
             citation_coverage=float(citation_result["citation_coverage"]),
+            retry_count=retry_count,
+            retry_trace=retry_trace,
+            auto_retry_triggered=auto_retry_triggered,
+            final_low_confidence=final_low_confidence,
         )
 
     @app.post("/feedback", response_model=FeedbackResponse)
@@ -2381,6 +2430,9 @@ def create_app() -> FastAPI:
                 "citation_count",
                 "answer_status",
                 "confidence",
+                "retry_count",
+                "auto_retry_triggered",
+                "final_low_confidence",
                 "latency_ms",
                 "total_tokens",
                 "request_id",
@@ -2484,58 +2536,46 @@ def create_app() -> FastAPI:
         question = next((message.content for message in reversed(request.messages) if message.role == "user"), "")
         if not question:
             raise HTTPException(status_code=400, detail="At least one user message is required")
-        top_k = request.top_k or state.settings.rag_top_k
-        retrieval_query = await rewrite_query_async(
-            state.chat_model,
-            question,
-            request.messages[:-1],
-            state.settings.openai_timeout_seconds,
+        kb = await get_knowledge_base(state.settings, api_key.knowledge_base_id)
+        top_k = request.top_k or (kb.retrieval_top_k if kb else None) or state.settings.rag_top_k
+        rerank_top_n = (
+            request.rerank_top_n
+            if request.rerank_top_n is not None
+            else kb.rerank_top_n
+            if kb and kb.rerank_top_n is not None
+            else state.settings.rerank_top_n
         )
-        retrieval = await asyncio.wait_for(
-            hybrid_search(
-                state.settings,
-                state.vector_store,
-                retrieval_query,
-                top_k=top_k,
-                user_id=api_key.user_id,
-                knowledge_base_id=api_key.knowledge_base_id,
-            ),
-            timeout=state.settings.retrieval_timeout_seconds,
+        low_confidence_threshold = (
+            request.low_confidence_threshold
+            if request.low_confidence_threshold is not None
+            else kb.low_confidence_threshold
+            if kb
+            else 0.35
         )
-        ranked_documents = await rerank_or_original_async(
-            state.reranker,
-            retrieval_query,
-            retrieval.documents,
-            state.settings.rerank_top_n,
-            state.settings.rerank_timeout_seconds,
+        max_retries = request.max_retries if request.max_retries is not None else kb.low_confidence_max_retries if kb else 1
+        history_text = "\n".join(f"{item.role}: {item.content}" for item in request.messages[:-1]) or "No prior messages."
+        attempt_result = await run_cited_answer_attempts(
+            state,
+            question=question,
+            history=request.messages[:-1],
+            history_text=history_text,
+            user_id=api_key.user_id,
+            knowledge_base_id=api_key.knowledge_base_id,
+            top_k=top_k,
+            rerank_top_n=rerank_top_n,
+            low_confidence_threshold=low_confidence_threshold,
+            max_retries=max_retries,
+            score_threshold=request.score_threshold,
         )
-        selected = ranked_documents[: state.settings.rerank_top_n or len(ranked_documents)]
-        if selected:
-            prompt = build_prompt().invoke(
-                {
-                    "question": question,
-                    "context": format_context([item.document for item in selected]),
-                    "history": "\n".join(f"{item.role}: {item.content}" for item in request.messages[:-1]) or "No prior messages.",
-                }
-            )
-            answer = str((await invoke_chat_model(
-                state.chat_model,
-                prompt,
-                state.settings.openai_timeout_seconds,
-            )).content)
-        else:
-            answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
-        source_models = [
-            source_from_document(item.document, item.score, source_index=index)
-            for index, item in enumerate(selected, start=1)
-        ]
-        citation_result = evaluate_citations(str(answer), source_models)
-        if citation_result["answer_status"] != "supported":
-            answer = insufficient_evidence_answer(citation_result["answer_status"])
-            confidence = "low"
-            confidence_score = citation_result["citation_coverage"]
-        else:
-            confidence, confidence_score = answer_confidence(source_models)
+        answer = str(attempt_result["answer"])
+        source_models = attempt_result["sources"]
+        citation_result = attempt_result["citation_result"]
+        confidence = attempt_result["confidence"]
+        confidence_score = attempt_result["confidence_score"]
+        retry_trace = attempt_result["retry_trace"]
+        retry_count = int(attempt_result["retry_count"])
+        auto_retry_triggered = bool(attempt_result["auto_retry_triggered"])
+        final_low_confidence = bool(attempt_result["final_low_confidence"])
         sources = [source.model_dump() for source in source_models]
         conversation_id = request.conversation_id or str(uuid4())
         latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -2561,6 +2601,10 @@ def create_app() -> FastAPI:
             answer_status=str(citation_result["answer_status"]),
             confidence=confidence,
             confidence_score=confidence_score,
+            retry_count=retry_count,
+            retry_trace=retry_trace,
+            auto_retry_triggered=auto_retry_triggered,
+            final_low_confidence=final_low_confidence,
             latency_ms=latency_ms,
         )
         await add_audit_log(
@@ -2577,6 +2621,13 @@ def create_app() -> FastAPI:
                 "citation_count": citation_result["citation_count"],
                 "citation_coverage": citation_result["citation_coverage"],
                 "answer_status": citation_result["answer_status"],
+                "low_confidence_threshold": low_confidence_threshold,
+                "score_threshold": request.score_threshold,
+                "max_retries": max_retries,
+                "retry_count": retry_count,
+                "auto_retry_triggered": auto_retry_triggered,
+                "final_low_confidence": final_low_confidence,
+                "retry_trace": retry_trace,
             },
             latency_ms=latency_ms,
             **request_context,
@@ -2604,6 +2655,10 @@ def create_app() -> FastAPI:
             "answer_status": citation_result["answer_status"],
             "citation_count": citation_result["citation_count"],
             "citation_coverage": citation_result["citation_coverage"],
+            "retry_count": retry_count,
+            "retry_trace": retry_trace,
+            "auto_retry_triggered": auto_retry_triggered,
+            "final_low_confidence": final_low_confidence,
             "conversation_id": conversation_id,
         }
 
@@ -2846,6 +2901,207 @@ def answer_confidence(sources: list[Source]) -> tuple[str, float | None]:
     return "low", best_score
 
 
+def should_retry_answer(
+    *,
+    confidence: str,
+    confidence_score: float | None,
+    answer_status: str,
+    threshold: float,
+) -> bool:
+    if answer_status != "supported":
+        return True
+    if confidence == "low":
+        return True
+    return confidence_score is not None and confidence_score < threshold
+
+
+def build_retry_attempts(
+    *,
+    top_k: int,
+    rerank_top_n: int,
+    max_retries: int,
+    score_threshold: float | None = None,
+) -> list[dict[str, Any]]:
+    attempts: list[dict[str, Any]] = [
+        {
+            "attempt_index": 0,
+            "top_k": top_k,
+            "rerank_top_n": rerank_top_n,
+            "query_rewrite_enabled": True,
+            "rerank_enabled": rerank_top_n > 0,
+            "score_threshold": None,
+        }
+    ]
+    for index in range(1, max_retries + 1):
+        expanded_top_k = min(50, max(top_k + 4, top_k * (index + 1)))
+        expanded_rerank_top_n = (
+            min(50, max(rerank_top_n, min(expanded_top_k, rerank_top_n + index * 2)))
+            if rerank_top_n > 0
+            else 0
+        )
+        attempts.append(
+            {
+                "attempt_index": index,
+                "top_k": expanded_top_k,
+                "rerank_top_n": expanded_rerank_top_n,
+                "query_rewrite_enabled": index % 2 == 0,
+                "rerank_enabled": rerank_top_n > 0 and index < 2 and expanded_rerank_top_n > 0,
+                "score_threshold": score_threshold,
+            }
+        )
+    return attempts
+
+
+def document_fallback_score(document: Document) -> float | None:
+    for key in ("hybrid_score", "vector_score", "bm25_score"):
+        value = document.metadata.get(key)
+        if value is not None:
+            return float(value)
+    return None
+
+
+async def run_cited_answer_attempts(
+    state: RagState,
+    *,
+    question: str,
+    history: list[Any],
+    history_text: str,
+    user_id: str,
+    knowledge_base_id: str,
+    top_k: int,
+    rerank_top_n: int,
+    low_confidence_threshold: float,
+    max_retries: int,
+    score_threshold: float | None = None,
+) -> dict[str, Any]:
+    retry_trace: list[dict[str, Any]] = []
+    final: dict[str, Any] | None = None
+    for attempt in build_retry_attempts(
+        top_k=top_k,
+        rerank_top_n=rerank_top_n,
+        max_retries=max_retries,
+        score_threshold=score_threshold,
+    ):
+        retrieval_query = (
+            await rewrite_query_async(
+                state.chat_model,
+                question,
+                history,
+                state.settings.openai_timeout_seconds,
+            )
+            if attempt["query_rewrite_enabled"]
+            else question
+        )
+        retrieval = await asyncio.wait_for(
+            hybrid_search(
+                state.settings,
+                state.vector_store,
+                retrieval_query,
+                user_id=user_id,
+                knowledge_base_id=knowledge_base_id,
+                top_k=attempt["top_k"],
+            ),
+            timeout=state.settings.retrieval_timeout_seconds,
+        )
+        if retrieval.documents and attempt["rerank_enabled"]:
+            ranked_documents = await rerank_or_original_async(
+                state.reranker,
+                retrieval_query,
+                retrieval.documents,
+                attempt["rerank_top_n"],
+                state.settings.rerank_timeout_seconds,
+            )
+        else:
+            ranked_documents = [
+                RerankedDocument(document=document, score=document_fallback_score(document))
+                for document in retrieval.documents
+            ]
+        selected = ranked_documents[: attempt["rerank_top_n"] or len(ranked_documents)]
+        if attempt["score_threshold"] is not None and attempt["rerank_enabled"]:
+            selected = [
+                item
+                for item in selected
+                if item.score is None or float(item.score) >= float(attempt["score_threshold"])
+            ]
+        if selected:
+            prompt = build_prompt().invoke(
+                {
+                    "question": question,
+                    "context": format_context([item.document for item in selected]),
+                    "history": history_text,
+                }
+            )
+            answer = str(
+                (
+                    await invoke_chat_model(
+                        state.chat_model,
+                        prompt,
+                        state.settings.openai_timeout_seconds,
+                    )
+                ).content
+            )
+        else:
+            answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
+        sources = [
+            source_from_document(item.document, rerank_score=item.score, source_index=index)
+            for index, item in enumerate(selected, start=1)
+        ]
+        citation_result = evaluate_citations(answer, sources)
+        if citation_result["answer_status"] != "supported":
+            answer = insufficient_evidence_answer(citation_result["answer_status"])
+            confidence = "low"
+            confidence_score = citation_result["citation_coverage"]
+        else:
+            confidence, confidence_score = answer_confidence(sources)
+        attempt_summary = {
+            "attempt_index": attempt["attempt_index"],
+            "top_k": attempt["top_k"],
+            "rerank_top_n": attempt["rerank_top_n"],
+            "query_rewrite_enabled": attempt["query_rewrite_enabled"],
+            "rerank_enabled": attempt["rerank_enabled"],
+            "score_threshold": attempt["score_threshold"],
+            "retrieval_query": retrieval_query,
+            "source_count": len(sources),
+            "citation_count": int(citation_result["citation_count"]),
+            "citation_coverage": float(citation_result["citation_coverage"]),
+            "answer_status": str(citation_result["answer_status"]),
+            "confidence": confidence,
+            "confidence_score": confidence_score,
+        }
+        retry_trace.append(attempt_summary)
+        final = {
+            "answer": answer,
+            "sources": sources,
+            "citation_result": citation_result,
+            "confidence": confidence,
+            "confidence_score": confidence_score,
+            "retrieval_query": retrieval_query,
+        }
+        if not should_retry_answer(
+            confidence=confidence,
+            confidence_score=confidence_score,
+            answer_status=str(citation_result["answer_status"]),
+            threshold=low_confidence_threshold,
+        ):
+            break
+    if final is None:
+        raise RuntimeError("No chat attempt was executed")
+    retry_count = max(0, len(retry_trace) - 1)
+    final_low_confidence = should_retry_answer(
+        confidence=final["confidence"],
+        confidence_score=final["confidence_score"],
+        answer_status=str(final["citation_result"]["answer_status"]),
+        threshold=low_confidence_threshold,
+    )
+    return {
+        **final,
+        "retry_count": retry_count,
+        "retry_trace": retry_trace,
+        "auto_retry_triggered": retry_count > 0,
+        "final_low_confidence": final_low_confidence,
+    }
+
+
 def feedback_response(feedback: Feedback) -> FeedbackResponse:
     return FeedbackResponse(
         id=feedback.id,
@@ -2934,6 +3190,10 @@ def kb_response(kb: Any, stats: Any | None = None, capabilities: Any | None = No
         description=kb.description,
         visibility=kb.visibility,
         department_ids=kb.department_ids,
+        retrieval_top_k=kb.retrieval_top_k,
+        rerank_top_n=kb.rerank_top_n,
+        low_confidence_threshold=kb.low_confidence_threshold,
+        low_confidence_max_retries=kb.low_confidence_max_retries,
         status=getattr(kb, "status", "active"),
         file_count=int(getattr(stats, "file_count", 0) if stats else 0),
         completed_file_count=int(getattr(stats, "completed_file_count", 0) if stats else 0),

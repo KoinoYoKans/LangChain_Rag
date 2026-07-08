@@ -26,6 +26,7 @@ import {
   Flex,
   Form,
   Input,
+  InputNumber,
   Layout,
   Menu,
   Modal,
@@ -385,6 +386,10 @@ function KnowledgeWorkspace({ api, user }) {
       description: item.description,
       visibility: item.visibility,
       department_ids: item.department_ids || [],
+      retrieval_top_k: item.retrieval_top_k,
+      rerank_top_n: item.rerank_top_n,
+      low_confidence_threshold: item.low_confidence_threshold ?? 0.35,
+      low_confidence_max_retries: item.low_confidence_max_retries ?? 1,
     });
   }
 
@@ -416,6 +421,22 @@ function KnowledgeWorkspace({ api, user }) {
           <Form.Item name="department_ids" label="授权部门">
             <Select mode="multiple" allowClear options={(departments.data || []).map((item) => ({ value: item.id, label: item.name }))} />
           </Form.Item>
+          <Flex gap={8}>
+            <Form.Item name="retrieval_top_k" label="Top K" className="grow">
+              <InputNumber min={1} max={50} placeholder="全局默认" className="full-select" />
+            </Form.Item>
+            <Form.Item name="rerank_top_n" label="重排数" className="grow">
+              <InputNumber min={0} max={50} placeholder="全局默认" className="full-select" />
+            </Form.Item>
+          </Flex>
+          <Flex gap={8}>
+            <Form.Item name="low_confidence_threshold" label="低可信阈值" initialValue={0.35} className="grow">
+              <InputNumber min={0} max={1} step={0.05} className="full-select" />
+            </Form.Item>
+            <Form.Item name="low_confidence_max_retries" label="最大重试" initialValue={1} className="grow">
+              <InputNumber min={0} max={3} className="full-select" />
+            </Form.Item>
+          </Flex>
           <Button type="primary" htmlType="submit" loading={createKb.isPending}>创建知识库</Button>
         </Form>
         <div className="kb-list">
@@ -424,7 +445,7 @@ function KnowledgeWorkspace({ api, user }) {
               <Flex justify="space-between" align="start" gap={8}>
                 <div>
                   <strong>{item.name}</strong>
-                  <span>{item.visibility} · {item.completed_file_count}/{item.file_count} 文件 · {item.failed_job_count} 失败</span>
+                  <span>{item.visibility} · TopK {item.retrieval_top_k || "全局"} · 重试 {item.low_confidence_max_retries ?? 1} · {item.completed_file_count}/{item.file_count} 文件</span>
                 </div>
                 <Space onClick={(event) => event.stopPropagation()}>
               {item.can_manage_settings && <Button size="small" icon={<EditOutlined />} onClick={() => openEditKb(item)} />}
@@ -636,6 +657,22 @@ function KnowledgeWorkspace({ api, user }) {
           <Form.Item name="department_ids" label="授权部门">
             <Select mode="multiple" allowClear options={(departments.data || []).map((item) => ({ value: item.id, label: item.name }))} />
           </Form.Item>
+          <Flex gap={8}>
+            <Form.Item name="retrieval_top_k" label="Top K" className="grow">
+              <InputNumber min={1} max={50} placeholder="全局默认" className="full-select" />
+            </Form.Item>
+            <Form.Item name="rerank_top_n" label="重排数" className="grow">
+              <InputNumber min={0} max={50} placeholder="全局默认" className="full-select" />
+            </Form.Item>
+          </Flex>
+          <Flex gap={8}>
+            <Form.Item name="low_confidence_threshold" label="低可信阈值" className="grow">
+              <InputNumber min={0} max={1} step={0.05} className="full-select" />
+            </Form.Item>
+            <Form.Item name="low_confidence_max_retries" label="最大重试" className="grow">
+              <InputNumber min={0} max={3} className="full-select" />
+            </Form.Item>
+          </Flex>
         </Form>
       </Modal>
     </section>
@@ -960,6 +997,7 @@ function ChatWorkspace({ api }) {
                 <Space>
                   <Tag color={confidenceColor(item.confidence)}>{confidenceText(item.confidence, item.confidence_score)}</Tag>
                   <Tag>{answerStatusText(item.answer_status)}</Tag>
+                  {item.auto_retry_triggered && <Tag color="blue">自动重试 {item.retry_count}</Tag>}
                   {item.assistant_message_id && (
                     <>
                       <Button size="small" icon={<LikeOutlined />} onClick={() => submitFeedback(item, "up")} />
@@ -1231,6 +1269,19 @@ function AuditWorkspace({ api }) {
     refetchInterval: 10000,
     queryFn: async () => (await api.get("/chat-operations", { params: compactParams(chatFilters) })).data.items || [],
   });
+  const chatOpsStats = useMemo(() => {
+    const rows = chatOperations.data || [];
+    const total = rows.length || 1;
+    const low = rows.filter((item) => item.final_low_confidence || item.confidence === "low").length;
+    const retried = rows.filter((item) => item.retry_count > 0).length;
+    const improved = rows.filter((item) => item.retry_count > 0 && !item.final_low_confidence).length;
+    return {
+      lowRatio: `${Math.round((low / total) * 100)}%`,
+      retried,
+      improved,
+      stillFailed: rows.filter((item) => item.retry_count > 0 && item.final_low_confidence).length,
+    };
+  }, [chatOperations.data]);
   const exportChatOperations = useMutation({
     mutationFn: async () => api.get("/chat-operations/export", { params: compactParams(chatFilters), responseType: "blob" }),
     onSuccess: ({ data }) => {
@@ -1295,6 +1346,12 @@ function AuditWorkspace({ api }) {
                   <Switch checked={chatFilters.no_citations} onChange={(value) => updateChatFilter("no_citations", value)} checkedChildren="无引用" unCheckedChildren="无引用" />
                   <Button onClick={() => exportChatOperations.mutate()} loading={exportChatOperations.isPending}>导出 CSV</Button>
                 </Space>
+                <Space className="table-tools" wrap>
+                  <Tag color="red">低可信 {chatOpsStats.lowRatio}</Tag>
+                  <Tag color="blue">已重试 {chatOpsStats.retried}</Tag>
+                  <Tag color="green">重试改善 {chatOpsStats.improved}</Tag>
+                  <Tag color="orange">仍失败 {chatOpsStats.stillFailed}</Tag>
+                </Space>
                 <Table
                   rowKey="id"
                   loading={chatOperations.isLoading}
@@ -1306,6 +1363,7 @@ function AuditWorkspace({ api }) {
                     { title: "反馈", dataIndex: "feedback_rating", width: 90, render: (value) => value ? <Tag color={value === "up" ? "green" : "red"}>{value === "up" ? "赞" : "踩"}</Tag> : "-" },
                     { title: "引用", width: 90, render: (_, row) => `${row.citation_count || 0}/${row.source_count || 0}` },
                     { title: "可信度", dataIndex: "confidence", width: 110, render: (value, row) => <Tag color={confidenceColor(value)}>{confidenceText(value, row.confidence_score)}</Tag> },
+                    { title: "重试", dataIndex: "retry_count", width: 90, render: (value, row) => value ? <Tag color={row.final_low_confidence ? "red" : "blue"}>{value}</Tag> : "-" },
                     { title: "耗时", dataIndex: "latency_ms", width: 100, render: (value) => value == null ? "-" : `${value}ms` },
                     { title: "估算Tokens", dataIndex: "total_tokens", width: 110, render: (value) => value ?? "-" },
                     { title: "时间", dataIndex: "created_at", width: 180, render: formatTime },
@@ -1392,12 +1450,36 @@ function ChatOperationDetail({ row }) {
           { key: "latency", label: "耗时", children: row.latency_ms == null ? "-" : `${row.latency_ms}ms` },
           { key: "tokens", label: "估算 Token", children: row.total_tokens ?? "-" },
           { key: "feedback", label: "反馈", children: row.feedback_rating || "-" },
+          { key: "retry", label: "自动重试", children: row.auto_retry_triggered ? `${row.retry_count} 次` : "否" },
+          { key: "final_low", label: "最终低可信", children: row.final_low_confidence ? "是" : "否" },
         ]}
       />
       <Typography.Title level={5}>问题</Typography.Title>
       <Typography.Paragraph>{row.question}</Typography.Paragraph>
       <Typography.Title level={5}>回答</Typography.Title>
       <Typography.Paragraph className="answer-content">{row.answer}</Typography.Paragraph>
+      {(row.retry_trace || []).length > 0 && (
+        <>
+          <Typography.Title level={5}>检索重试轨迹</Typography.Title>
+          <Table
+            rowKey={(item) => item.attempt_index}
+            size="small"
+            pagination={false}
+            dataSource={row.retry_trace || []}
+            columns={[
+              { title: "#", dataIndex: "attempt_index", width: 60 },
+              { title: "Top K", dataIndex: "top_k", width: 80 },
+              { title: "重排数", dataIndex: "rerank_top_n", width: 90 },
+              { title: "改写", dataIndex: "query_rewrite_enabled", width: 80, render: (value) => value ? "开" : "关" },
+              { title: "重排", dataIndex: "rerank_enabled", width: 80, render: (value) => value ? "开" : "关" },
+              { title: "状态", dataIndex: "answer_status", width: 130, render: answerStatusText },
+              { title: "可信度", dataIndex: "confidence", width: 120, render: (value, item) => confidenceText(value, item.confidence_score) },
+              { title: "引用", width: 80, render: (_, item) => `${item.citation_count || 0}/${item.source_count || 0}` },
+              { title: "检索问题", dataIndex: "retrieval_query", ellipsis: true },
+            ]}
+          />
+        </>
+      )}
       <Typography.Title level={5}>引用来源</Typography.Title>
       <Table
         rowKey={(source, index) => `${source.chunk_id || source.source_index}-${index}`}
@@ -1463,6 +1545,10 @@ function buildChatRecordsFromMessages(items) {
         answer_status: item.metadata?.answer_status || "unknown",
         citation_count: item.metadata?.citation_count || 0,
         citation_coverage: item.metadata?.citation_coverage || 0,
+        retry_count: item.metadata?.retry_count || 0,
+        retry_trace: item.metadata?.retry_trace || [],
+        auto_retry_triggered: Boolean(item.metadata?.auto_retry_triggered),
+        final_low_confidence: Boolean(item.metadata?.final_low_confidence),
       });
       pendingQuestion = null;
     }
@@ -1480,6 +1566,10 @@ function buildChatRecordsFromMessages(items) {
       answer_status: "interrupted",
       citation_count: 0,
       citation_coverage: 0,
+      retry_count: 0,
+      retry_trace: [],
+      auto_retry_triggered: false,
+      final_low_confidence: true,
     });
   }
   return records;
