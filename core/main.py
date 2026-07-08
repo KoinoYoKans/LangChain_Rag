@@ -982,7 +982,14 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseResponse:
         settings = get_state(app).settings
-        await require_kb_settings_admin(settings, knowledge_base_id, current_user)
+        await require_kb_capability_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.update.denied",
+            capability="settings",
+        )
         kb = await update_knowledge_base(
             settings,
             kb_id=knowledge_base_id,
@@ -1028,7 +1035,14 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseResponse:
         settings = get_state(app).settings
-        await require_kb_settings_admin(settings, knowledge_base_id, current_user)
+        await require_kb_capability_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.delete.denied",
+            capability="settings",
+        )
         kb = await soft_delete_knowledge_base(settings, kb_id=knowledge_base_id, user=current_user)
         await add_audit_log(
             settings,
@@ -1045,11 +1059,18 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge-bases/{knowledge_base_id}/stats")
     async def knowledge_base_stats_endpoint(
+        http_request: Request,
         knowledge_base_id: str,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> dict[str, int]:
         settings = get_state(app).settings
-        await require_knowledge_base_access(settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.stats.denied",
+        )
         stats = await get_knowledge_base_stats(settings, knowledge_base_id)
         return {
             "file_count": stats.file_count,
@@ -1059,12 +1080,26 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge-bases/{knowledge_base_id}/members", response_model=KnowledgeBaseMemberListResponse)
     async def knowledge_base_members_endpoint(
+        http_request: Request,
         knowledge_base_id: str,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseMemberListResponse:
         settings = get_state(app).settings
-        await require_knowledge_base_access(settings, knowledge_base_id, current_user)
-        await require_kb_member_admin(settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.members.denied",
+        )
+        await require_kb_capability_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.members.denied",
+            capability="members",
+        )
         return KnowledgeBaseMemberListResponse(
             items=[
                 kb_member_response(item)
@@ -1074,11 +1109,19 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge-bases/{knowledge_base_id}/member-candidates")
     async def knowledge_base_member_candidates_endpoint(
+        http_request: Request,
         knowledge_base_id: str,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> dict[str, list[UserResponse]]:
         settings = get_state(app).settings
-        await require_kb_member_admin(settings, knowledge_base_id, current_user)
+        await require_kb_capability_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.member_candidates.denied",
+            capability="members",
+        )
         return {"items": [user_response(item) for item in await list_users(settings, current_user.org_id) if item.is_active]}
 
     @app.put("/knowledge-bases/{knowledge_base_id}/members", response_model=KnowledgeBaseMemberResponse)
@@ -1089,8 +1132,22 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseMemberResponse:
         settings = get_state(app).settings
-        await require_knowledge_base_access(settings, knowledge_base_id, current_user, write=True)
-        await require_kb_member_admin(settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.member_upsert.denied",
+            write=True,
+        )
+        await require_kb_capability_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.member_upsert.denied",
+            capability="members",
+        )
         member = await upsert_knowledge_base_member(
             settings,
             kb_id=knowledge_base_id,
@@ -1121,8 +1178,22 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> dict[str, str]:
         settings = get_state(app).settings
-        await require_knowledge_base_access(settings, knowledge_base_id, current_user, write=True)
-        await require_kb_member_admin(settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.member_remove.denied",
+            write=True,
+        )
+        await require_kb_capability_or_audit(
+            settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="knowledge_base.member_remove.denied",
+            capability="members",
+        )
         revoked_key_count = await revoke_api_keys_for_kb_user(settings, kb_id=knowledge_base_id, user_id=member_user_id)
         await remove_knowledge_base_member(settings, kb_id=knowledge_base_id, user_id=member_user_id)
         await add_audit_log(
@@ -1147,7 +1218,7 @@ def create_app() -> FastAPI:
         settings = get_state(app).settings
         knowledge_base_ids = None
         if not current_user.is_admin:
-            knowledge_base_ids = [item.id for item in await list_knowledge_bases(settings, current_user)]
+            knowledge_base_ids = await manageable_knowledge_base_ids(settings, current_user)
         return AuditLogListResponse(
             items=await list_audit_logs(
                 settings,
@@ -1179,7 +1250,14 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> ApiKeyCreateResponse:
         state = get_state(app)
-        await require_kb_api_key_admin(state.settings, request.knowledge_base_id, current_user)
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=request.knowledge_base_id,
+            user=current_user,
+            action="api_key.create.denied",
+            capability="api_keys",
+        )
         created = await create_api_key(
             state.settings,
             org_id=current_user.org_id,
@@ -1210,7 +1288,14 @@ def create_app() -> FastAPI:
         existing = await get_api_key(state.settings, current_user.org_id, api_key_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="API key not found")
-        await require_kb_api_key_admin(state.settings, existing.knowledge_base_id, current_user)
+        await require_kb_capability_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=existing.knowledge_base_id,
+            user=current_user,
+            action="api_key.revoke.denied",
+            capability="api_keys",
+        )
         revoked = await revoke_api_key(state.settings, current_user.org_id, api_key_id)
         if revoked is None:
             raise HTTPException(status_code=404, detail="API key not found")
@@ -1324,7 +1409,14 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> IngestJobResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.ingest_requested.denied",
+            write=True,
+        )
         filename = file.filename or "uploaded"
         if not any(filename.lower().endswith(extension) for extension in SUPPORTED_EXTENSIONS):
             supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
@@ -1372,7 +1464,14 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> IngestJobResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="url.ingest_requested.denied",
+            write=True,
+        )
         job = await create_ingest_job(
             state.settings,
             org_id=current_user.org_id,
@@ -1405,7 +1504,14 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> UrlImportPlanResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="batch_import.dry_run.denied",
+            write=True,
+        )
         plan = await build_url_import_plan(
             state.settings,
             org_id=current_user.org_id,
@@ -1436,7 +1542,14 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> BatchOperationResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="batch_import.confirm.denied",
+            write=True,
+        )
         lock_token = str(uuid4())
         if not acquire_import_plan_lock(state.settings, request.plan_id, lock_token):
             raise HTTPException(status_code=409, detail="Import plan is being confirmed")
@@ -1449,7 +1562,23 @@ def create_app() -> FastAPI:
                 or payload.get("user_id") != current_user.id
                 or payload.get("org_id") != current_user.org_id
             ):
-                raise HTTPException(status_code=403, detail="Import plan does not belong to this user and knowledge base")
+                exc = HTTPException(status_code=403, detail="Import plan does not belong to this user and knowledge base")
+                await audit_access_denied(
+                    state.settings,
+                    request=http_request,
+                    user=current_user,
+                    action="batch_import.confirm.denied",
+                    target_type="knowledge_base",
+                    target_id=knowledge_base_id,
+                    error=exc,
+                    metadata={
+                        "knowledge_base_id": knowledge_base_id,
+                        "plan_id": request.plan_id,
+                        "plan_knowledge_base_id": payload.get("knowledge_base_id"),
+                        "plan_user_id": payload.get("user_id"),
+                    },
+                )
+                raise exc
             expires_at = parse_datetime(str(payload.get("expires_at") or ""))
             if expires_at and expires_at < datetime.now(timezone.utc):
                 raise HTTPException(status_code=410, detail="Import plan has expired")
@@ -1519,13 +1648,20 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge-bases/{knowledge_base_id}/ingest-jobs", response_model=IngestJobListResponse)
     async def knowledge_base_ingest_jobs(
+        http_request: Request,
         knowledge_base_id: str,
         limit: int = Query(default=100, ge=1, le=500),
         status: str = Query(default="all", pattern="^(active|history|all|pending|running|succeeded|failed|cancelled)$"),
         current_user: CurrentUser = Depends(require_current_user),
     ) -> IngestJobListResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="ingest_jobs.list.denied",
+        )
         return IngestJobListResponse(
             items=[
                 ingest_job_response(item)
@@ -1535,11 +1671,18 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge-bases/{knowledge_base_id}/queue-health", response_model=QueueHealthResponse)
     async def knowledge_base_queue_health(
+        http_request: Request,
         knowledge_base_id: str,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> QueueHealthResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="queue_health.read.denied",
+        )
         redis_queue_length = -1
         worker_last_seen_at = None
         try:
@@ -1555,6 +1698,7 @@ def create_app() -> FastAPI:
 
     @app.get("/ingest-jobs/{job_id}", response_model=IngestJobResponse)
     async def ingest_job_detail(
+        http_request: Request,
         job_id: str,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> IngestJobResponse:
@@ -1562,7 +1706,14 @@ def create_app() -> FastAPI:
         job = await get_ingest_job(state.settings, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Ingest job not found")
-        await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=job.knowledge_base_id,
+            user=current_user,
+            action="ingest.detail.denied",
+            metadata={"job_id": job_id},
+        )
         return ingest_job_response(job)
 
     @app.post("/ingest-jobs/{job_id}/retry", response_model=IngestJobResponse)
@@ -1575,7 +1726,15 @@ def create_app() -> FastAPI:
         job = await get_ingest_job(state.settings, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Ingest job not found")
-        await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=job.knowledge_base_id,
+            user=current_user,
+            action="ingest.retry_requested.denied",
+            write=True,
+            metadata={"job_id": job_id},
+        )
         try:
             retried = await retry_failed_ingest_job(state.settings, job_id)
         except ValueError as exc:
@@ -1604,7 +1763,15 @@ def create_app() -> FastAPI:
         job = await get_ingest_job(state.settings, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Ingest job not found")
-        await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=job.knowledge_base_id,
+            user=current_user,
+            action="ingest.cancel_requested.denied",
+            write=True,
+            metadata={"job_id": job_id},
+        )
         try:
             cancelled = await cancel_ingest_job(state.settings, job_id)
         except ValueError as exc:
@@ -1630,12 +1797,22 @@ def create_app() -> FastAPI:
     ) -> BatchOperationResponse:
         state = get_state(app)
         results: list[BatchItemResult] = []
+        touched_kb_ids: set[str] = set()
         for job_id in request.job_ids:
             try:
                 job = await get_ingest_job(state.settings, job_id)
                 if job is None:
                     raise ValueError("Ingest job not found")
-                await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user, write=True)
+                await require_kb_access_or_audit(
+                    state.settings,
+                    request=http_request,
+                    kb_id=job.knowledge_base_id,
+                    user=current_user,
+                    action="ingest.batch_retry_requested.denied",
+                    write=True,
+                    metadata={"job_id": job_id},
+                )
+                touched_kb_ids.add(job.knowledge_base_id)
                 retried = await retry_failed_ingest_job(state.settings, job_id)
                 enqueue_ingest_job(state.settings, job_id)
                 results.append(BatchItemResult(id=job_id, status="succeeded", job_id=retried.id))
@@ -1648,7 +1825,12 @@ def create_app() -> FastAPI:
             actor_department_id=current_user.department_id,
             action="ingest.batch_retry_requested",
             target_type="ingest_job",
-            metadata={"job_count": len(request.job_ids), "failed": sum(1 for item in results if item.status == "failed")},
+            metadata={
+                "job_count": len(request.job_ids),
+                "failed": sum(1 for item in results if item.status == "failed"),
+                "knowledge_base_id": next(iter(touched_kb_ids)) if len(touched_kb_ids) == 1 else None,
+                "knowledge_base_ids": sorted(touched_kb_ids),
+            },
             **audit_context(http_request),
         )
         return batch_response(results)
@@ -1661,12 +1843,22 @@ def create_app() -> FastAPI:
     ) -> BatchOperationResponse:
         state = get_state(app)
         results: list[BatchItemResult] = []
+        touched_kb_ids: set[str] = set()
         for job_id in request.job_ids:
             try:
                 job = await get_ingest_job(state.settings, job_id)
                 if job is None:
                     raise ValueError("Ingest job not found")
-                await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user, write=True)
+                await require_kb_access_or_audit(
+                    state.settings,
+                    request=http_request,
+                    kb_id=job.knowledge_base_id,
+                    user=current_user,
+                    action="ingest.batch_cancel_requested.denied",
+                    write=True,
+                    metadata={"job_id": job_id},
+                )
+                touched_kb_ids.add(job.knowledge_base_id)
                 cancelled = await cancel_ingest_job(state.settings, job_id)
                 results.append(BatchItemResult(id=job_id, status="succeeded", job_id=cancelled.id))
             except Exception as exc:  # noqa: BLE001
@@ -1678,13 +1870,19 @@ def create_app() -> FastAPI:
             actor_department_id=current_user.department_id,
             action="ingest.batch_cancel_requested",
             target_type="ingest_job",
-            metadata={"job_count": len(request.job_ids), "failed": sum(1 for item in results if item.status == "failed")},
+            metadata={
+                "job_count": len(request.job_ids),
+                "failed": sum(1 for item in results if item.status == "failed"),
+                "knowledge_base_id": next(iter(touched_kb_ids)) if len(touched_kb_ids) == 1 else None,
+                "knowledge_base_ids": sorted(touched_kb_ids),
+            },
             **audit_context(http_request),
         )
         return batch_response(results)
 
     @app.get("/knowledge-bases/{knowledge_base_id}/documents", response_model=FileListResponse)
     async def knowledge_base_documents(
+        http_request: Request,
         knowledge_base_id: str,
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
@@ -1693,7 +1891,13 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> FileListResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.list.denied",
+        )
         return FileListResponse(
             items=[
                 file_record_response(item)
@@ -1710,12 +1914,20 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge-bases/{knowledge_base_id}/documents/{file_id}/preview", response_model=DocumentPreviewResponse)
     async def knowledge_base_document_preview(
+        http_request: Request,
         knowledge_base_id: str,
         file_id: str,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> DocumentPreviewResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.preview.denied",
+            metadata={"file_id": file_id},
+        )
         item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -1727,12 +1939,20 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge-bases/{knowledge_base_id}/documents/{file_id}/raw")
     async def knowledge_base_document_raw(
+        http_request: Request,
         knowledge_base_id: str,
         file_id: str,
         current_user: CurrentUser = Depends(require_current_user),
     ) -> FileResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.raw.denied",
+            metadata={"file_id": file_id},
+        )
         item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
         if item is None or not item.source_uri:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -1749,7 +1969,15 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> IngestJobResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.reindex_requested.denied",
+            write=True,
+            metadata={"file_id": file_id},
+        )
         item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -1789,7 +2017,15 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> DeleteDocumentResponse:
         state = require_ready(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.delete.denied",
+            write=True,
+            metadata={"file_id": file_id},
+        )
         item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -1821,7 +2057,15 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> BatchOperationResponse:
         state = require_ready(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.batch_delete.denied",
+            write=True,
+            metadata={"file_count": len(request.file_ids)},
+        )
         results: list[BatchItemResult] = []
         for file_id in request.file_ids:
             try:
@@ -1855,7 +2099,15 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> BatchOperationResponse:
         state = get_state(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="document.batch_reindex_requested.denied",
+            write=True,
+            metadata={"file_count": len(request.file_ids)},
+        )
         results: list[BatchItemResult] = []
         for file_id in request.file_ids:
             try:
@@ -1936,13 +2188,20 @@ def create_app() -> FastAPI:
 
     @app.get("/conversations", response_model=ConversationListResponse)
     async def conversations(
+        http_request: Request,
         knowledge_base_id: str = Query(..., min_length=1),
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         current_user: CurrentUser = Depends(require_current_user),
     ) -> ConversationListResponse:
         state = require_ready(app)
-        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            action="conversation.list.denied",
+        )
         return ConversationListResponse(
             items=[
                 conversation_response(item)
@@ -1958,6 +2217,7 @@ def create_app() -> FastAPI:
 
     @app.get("/conversations/{conversation_id}/messages", response_model=ChatMessageListResponse)
     async def conversation_messages(
+        http_request: Request,
         conversation_id: UUID,
         knowledge_base_id: UUID = Query(...),
         limit: int = Query(default=200, ge=1, le=500),
@@ -1966,7 +2226,14 @@ def create_app() -> FastAPI:
         state = require_ready(app)
         conversation_id_text = str(conversation_id)
         knowledge_base_id_text = str(knowledge_base_id)
-        await require_knowledge_base_access(state.settings, knowledge_base_id_text, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id_text,
+            user=current_user,
+            action="conversation.messages.denied",
+            metadata={"conversation_id": conversation_id_text},
+        )
         conversation = await get_conversation(
             state.settings,
             conversation_id=conversation_id_text,
@@ -1999,7 +2266,14 @@ def create_app() -> FastAPI:
         state = require_ready(app)
         conversation_id_text = str(conversation_id)
         knowledge_base_id_text = str(knowledge_base_id)
-        await require_knowledge_base_access(state.settings, knowledge_base_id_text, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id_text,
+            user=current_user,
+            action="conversation.update.denied",
+            metadata={"conversation_id": conversation_id_text},
+        )
         title = request.title.strip()
         if not title:
             raise HTTPException(status_code=422, detail="Conversation title is required")
@@ -2035,7 +2309,14 @@ def create_app() -> FastAPI:
         state = require_ready(app)
         conversation_id_text = str(conversation_id)
         knowledge_base_id_text = str(knowledge_base_id)
-        await require_knowledge_base_access(state.settings, knowledge_base_id_text, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=knowledge_base_id_text,
+            user=current_user,
+            action="conversation.delete.denied",
+            metadata={"conversation_id": conversation_id_text},
+        )
         deleted = await delete_conversation(
             state.settings,
             conversation_id=conversation_id_text,
@@ -2064,7 +2345,13 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> ChatResponse:
         state = require_ready(app)
-        kb = await require_knowledge_base_access(state.settings, request.knowledge_base_id, current_user)
+        kb = await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=request.knowledge_base_id,
+            user=current_user,
+            action="chat.ask.denied",
+        )
         if await count_completed_knowledge_base_files(state.settings, request.knowledge_base_id) <= 0:
             raise HTTPException(
                 status_code=409,
@@ -2099,7 +2386,18 @@ def create_app() -> FastAPI:
                     title=request.message[:80],
                 )
             except ValueError as exc:
-                raise HTTPException(status_code=403, detail="Conversation is not available in this knowledge base") from exc
+                http_exc = HTTPException(status_code=403, detail="Conversation is not available in this knowledge base")
+                await audit_access_denied(
+                    state.settings,
+                    request=http_request,
+                    user=current_user,
+                    action="chat.ask.denied",
+                    target_type="knowledge_base",
+                    target_id=request.knowledge_base_id,
+                    error=http_exc,
+                    metadata={"knowledge_base_id": request.knowledge_base_id, "conversation_id": conversation_id},
+                )
+                raise http_exc from exc
             history = await get_recent_messages(
                 state.settings,
                 conversation_id=conversation_id,
@@ -2275,7 +2573,13 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> FeedbackResponse:
         state = require_ready(app)
-        await require_knowledge_base_access(state.settings, request.knowledge_base_id, current_user)
+        await require_kb_access_or_audit(
+            state.settings,
+            request=http_request,
+            kb_id=request.knowledge_base_id,
+            user=current_user,
+            action="feedback.create.denied",
+        )
         try:
             UUID(request.conversation_id)
             UUID(request.assistant_message_id)
@@ -2340,6 +2644,7 @@ def create_app() -> FastAPI:
 
     @app.get("/feedback", response_model=FeedbackListResponse)
     async def feedback_items(
+        http_request: Request,
         knowledge_base_id: str | None = Query(default=None),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -2348,7 +2653,13 @@ def create_app() -> FastAPI:
         state = require_ready(app)
         require_manager(current_user)
         if knowledge_base_id:
-            await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
+            await require_kb_access_or_audit(
+                state.settings,
+                request=http_request,
+                kb_id=knowledge_base_id,
+                user=current_user,
+                action="feedback.list.denied",
+            )
         elif not current_user.is_admin:
             raise HTTPException(status_code=403, detail="Managers must filter feedback by knowledge_base_id")
         return FeedbackListResponse(
@@ -3344,6 +3655,95 @@ async def require_kb_api_key_admin(settings: AppSettings, kb_id: str, user: Curr
     if capabilities.can_manage_api_keys:
         return
     raise HTTPException(status_code=403, detail="Knowledge base API key management denied")
+
+
+async def audit_access_denied(
+    settings: AppSettings,
+    *,
+    request: Request,
+    user: CurrentUser,
+    action: str,
+    target_type: str,
+    target_id: str | None,
+    error: HTTPException,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        await add_audit_log(
+            settings,
+            org_id=user.org_id,
+            actor_user_id=user.id,
+            actor_department_id=user.department_id,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            result="failed",
+            error_message=str(error.detail)[:1000],
+            metadata=metadata or {},
+            **audit_context(request),
+        )
+    except Exception:
+        return
+
+
+async def require_kb_access_or_audit(
+    settings: AppSettings,
+    *,
+    request: Request,
+    kb_id: str,
+    user: CurrentUser,
+    action: str,
+    write: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> Any:
+    try:
+        return await require_knowledge_base_access(settings, kb_id, user, write=write)
+    except HTTPException as exc:
+        if exc.status_code in {403, 404}:
+            await audit_access_denied(
+                settings,
+                request=request,
+                user=user,
+                action=action,
+                target_type="knowledge_base",
+                target_id=kb_id,
+                error=exc,
+                metadata={"knowledge_base_id": kb_id, "required_write": write, **(metadata or {})},
+            )
+        raise
+
+
+async def require_kb_capability_or_audit(
+    settings: AppSettings,
+    *,
+    request: Request,
+    kb_id: str,
+    user: CurrentUser,
+    action: str,
+    capability: str,
+) -> None:
+    try:
+        if capability == "members":
+            await require_kb_member_admin(settings, kb_id, user)
+        elif capability == "settings":
+            await require_kb_settings_admin(settings, kb_id, user)
+        elif capability == "api_keys":
+            await require_kb_api_key_admin(settings, kb_id, user)
+        else:
+            raise HTTPException(status_code=500, detail=f"Unknown knowledge base capability: {capability}")
+    except HTTPException as exc:
+        if exc.status_code in {403, 404}:
+            await audit_access_denied(
+                settings,
+                request=request,
+                user=user,
+                action=action,
+                target_type="knowledge_base",
+                target_id=kb_id,
+                error=exc,
+                metadata={"knowledge_base_id": kb_id, "required_capability": capability},
+            )
+        raise
 
 
 async def manageable_knowledge_base_ids(settings: AppSettings, user: CurrentUser) -> list[str]:

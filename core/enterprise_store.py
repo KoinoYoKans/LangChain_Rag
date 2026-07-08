@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, or_, select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import array, insert
 
 from config.database import (
     ApiKeyModel,
@@ -613,24 +613,27 @@ async def list_audit_logs(
 ) -> list[dict[str, Any]]:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
+        query = select(AuditLogModel).where(AuditLogModel.org_id == UUID(org_id))
+        allowed_ids = list(knowledge_base_ids or [])
+        if knowledge_base_ids is not None:
+            if not allowed_ids:
+                return []
+            query = query.where(
+                or_(
+                    AuditLogModel.target_id.in_(allowed_ids),
+                    AuditLogModel.metadata_["knowledge_base_id"].as_string().in_(allowed_ids),
+                    AuditLogModel.metadata_["bound_knowledge_base_id"].as_string().in_(allowed_ids),
+                    AuditLogModel.metadata_["knowledge_base_ids"].op("?|")(array(allowed_ids)),
+                )
+            )
         result = await session.scalars(
-            select(AuditLogModel)
-            .where(AuditLogModel.org_id == UUID(org_id))
+            query
             .order_by(AuditLogModel.created_at.desc())
-            .limit(limit if knowledge_base_ids is None else min(max(limit * 5, limit), 1000))
+            .limit(limit)
         )
-        allowed_ids = set(knowledge_base_ids or [])
         items: list[dict[str, Any]] = []
         for item in result:
             metadata = dict(item.metadata_ or {})
-            if knowledge_base_ids is not None:
-                target_ids = {
-                    str(item.target_id or ""),
-                    str(metadata.get("knowledge_base_id") or ""),
-                    str(metadata.get("bound_knowledge_base_id") or ""),
-                }
-                if allowed_ids.isdisjoint(target_ids):
-                    continue
             items.append(
                 {
                     "id": str(item.id),
