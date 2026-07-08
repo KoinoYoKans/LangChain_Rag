@@ -18,10 +18,19 @@ from core.file_store import (
     find_file_by_content_hash,
     delete_file_chunks_by_file_id,
     mark_file_completed,
+    mark_file_deleted,
     mark_file_failed,
     save_file_chunks,
 )
-from core.ingest_store import get_ingest_job, mark_job_failed, mark_job_file_id, mark_job_progress, mark_job_running, mark_job_succeeded
+from core.ingest_store import (
+    IngestJobCancelledError,
+    get_ingest_job,
+    mark_job_failed,
+    mark_job_file_id,
+    mark_job_progress,
+    mark_job_running,
+    mark_job_succeeded,
+)
 from core.vector_store import add_documents, build_vector_store, delete_documents, initialize_vector_extension
 
 
@@ -29,6 +38,8 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
     job = await get_ingest_job(settings, job_id)
     if job is None:
         raise ValueError(f"Ingest job not found: {job_id}")
+    if job.status == "cancelled":
+        raise IngestJobCancelledError(f"Ingest job has been cancelled: {job_id}")
     await mark_job_running(settings, job_id)
     file_id = str(uuid4())
     vector_store = None
@@ -38,6 +49,7 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
         parsed = source["parsed"]
         content_sha256 = hash_text(parsed.text)
         await mark_job_progress(settings, job_id, 25)
+        await _raise_if_cancelled(settings, job_id)
         existing = await find_file_by_content_hash(
             settings,
             user_id=job.created_by_user_id,
@@ -64,6 +76,7 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
             content_sha256=content_sha256,
         )
         await mark_job_file_id(settings, job_id, file_id)
+        await _raise_if_cancelled(settings, job_id)
         _, documents = build_chunks_from_text(
             filename=source["filename"],
             content_type=source["content_type"],
@@ -78,11 +91,13 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
             source_uri=source["source_uri"],
         )
         await mark_job_progress(settings, job_id, 45)
+        await _raise_if_cancelled(settings, job_id)
         embeddings = build_embeddings(settings)
         initialize_vector_extension(settings)
         vector_store = build_vector_store(settings, embeddings, initialize_first=False)
         ids, indexed_documents = add_documents(vector_store, documents)
         await mark_job_progress(settings, job_id, 70)
+        await _raise_if_cancelled(settings, job_id)
         await replace_document_pages(
             settings,
             org_id=job.org_id,
@@ -108,6 +123,7 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
             locations=locations,
         )
         await mark_job_progress(settings, job_id, 85)
+        await _raise_if_cancelled(settings, job_id)
         await save_file_chunks(
             settings,
             user_id=job.created_by_user_id,
@@ -124,13 +140,36 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
                 for index, document in enumerate(indexed_documents)
             ],
         )
+        await _raise_if_cancelled(settings, job_id)
         await mark_file_completed(settings, file_id, chunk_count=len(documents), chunk_ids=ids, vector_ids=ids)
+        await _raise_if_cancelled(settings, job_id)
         await mark_job_succeeded(settings, job_id, file_id=file_id)
         await add_audit_log(
             settings,
             org_id=job.org_id,
             actor_user_id=job.created_by_user_id,
             action="ingest.succeeded",
+            target_type="ingest_job",
+            target_id=job_id,
+            metadata={"file_id": file_id, "source_type": job.source_type},
+        )
+    except IngestJobCancelledError:
+        if vector_store is not None and ids:
+            try:
+                delete_documents(vector_store, ids)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await delete_file_chunks_by_file_id(settings, file_id)
+            await delete_document_artifacts(settings, file_id)
+            await mark_file_deleted(settings, file_id)
+        except Exception:  # noqa: BLE001
+            pass
+        await add_audit_log(
+            settings,
+            org_id=job.org_id,
+            actor_user_id=job.created_by_user_id,
+            action="ingest.cancelled",
             target_type="ingest_job",
             target_id=job_id,
             metadata={"file_id": file_id, "source_type": job.source_type},
@@ -162,6 +201,12 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
 
 def process_ingest_job_sync(settings: AppSettings, job_id: str) -> None:
     asyncio.run(process_ingest_job(settings, job_id))
+
+
+async def _raise_if_cancelled(settings: AppSettings, job_id: str) -> None:
+    job = await get_ingest_job(settings, job_id)
+    if job and job.status == "cancelled":
+        raise IngestJobCancelledError(f"Ingest job has been cancelled: {job_id}")
 
 
 def _load_job_source(payload: dict[str, Any], source_type: str, source_uri: str | None, filename: str | None) -> dict[str, Any]:

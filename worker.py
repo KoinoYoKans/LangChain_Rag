@@ -6,9 +6,9 @@ import signal
 import sys
 
 from config.settings import AppSettings
-from core.ingest_store import list_recoverable_ingest_jobs
+from core.ingest_store import IngestJobCancelledError, list_recoverable_ingest_jobs
 from core.ingestion import process_ingest_job
-from core.job_queue import wait_for_ingest_job
+from core.job_queue import record_worker_heartbeat, wait_for_ingest_job
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("rag-worker")
@@ -29,6 +29,10 @@ async def run_worker() -> int:
     LOGGER.info("Worker started")
     while not STOP:
         try:
+            await asyncio.to_thread(record_worker_heartbeat, settings)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Worker heartbeat failed: %s", exc)
+        try:
             job_id = await asyncio.to_thread(wait_for_ingest_job, settings, 5)
         except TimeoutError:
             recoverable = await list_recoverable_ingest_jobs(settings, limit=10)
@@ -48,6 +52,8 @@ async def run_worker() -> int:
         try:
             await process_ingest_job(settings, job_id)
             LOGGER.info("Completed ingest job %s", job_id)
+        except IngestJobCancelledError:
+            LOGGER.info("Cancelled ingest job %s", job_id)
         except Exception:  # noqa: BLE001
             LOGGER.exception("Failed ingest job %s", job_id)
     LOGGER.info("Worker stopped")

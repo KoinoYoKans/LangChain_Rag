@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -81,9 +82,17 @@ from core.file_store import (
     mark_file_failed,
     save_file_chunks,
 )
-from core.ingest_store import IngestJob, create_ingest_job, get_ingest_job, list_ingest_jobs
-from core.ingest_store import retry_failed_ingest_job
-from core.job_queue import enqueue_ingest_job
+from core.ingest_store import (
+    IngestJob,
+    IngestQueueHealth,
+    cancel_ingest_job,
+    create_ingest_job,
+    get_ingest_job,
+    get_ingest_queue_health,
+    list_ingest_jobs,
+    retry_failed_ingest_job,
+)
+from core.job_queue import enqueue_ingest_job, get_ingest_queue_length, get_worker_heartbeat
 from core.rerank import RerankedDocument, Reranker, build_reranker
 from core.retrieval import hybrid_search
 from core.vector_store import (
@@ -377,6 +386,42 @@ class IngestJobResponse(BaseModel):
 
 class IngestJobListResponse(BaseModel):
     items: list[IngestJobResponse]
+
+
+class QueueHealthResponse(BaseModel):
+    pending_count: int
+    running_count: int
+    succeeded_count: int
+    failed_count: int
+    cancelled_count: int
+    redis_queue_length: int
+    oldest_pending_at: str | None
+    oldest_pending_wait_seconds: int | None
+    oldest_running_at: str | None
+    oldest_running_seconds: int | None
+    worker_last_seen_at: str | None
+    worker_stale: bool
+
+
+class DocumentBatchRequest(BaseModel):
+    file_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class IngestJobBatchRequest(BaseModel):
+    job_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class BatchItemResult(BaseModel):
+    id: str
+    status: str
+    message: str | None = None
+    job_id: str | None = None
+
+
+class BatchOperationResponse(BaseModel):
+    succeeded: int
+    failed: int
+    items: list[BatchItemResult]
 
 
 class AuditLogListResponse(BaseModel):
@@ -1134,6 +1179,26 @@ def create_app() -> FastAPI:
             ]
         )
 
+    @app.get("/knowledge-bases/{knowledge_base_id}/queue-health", response_model=QueueHealthResponse)
+    async def knowledge_base_queue_health(
+        knowledge_base_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> QueueHealthResponse:
+        state = get_state(app)
+        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user)
+        redis_queue_length = -1
+        worker_last_seen_at = None
+        try:
+            redis_queue_length = get_ingest_queue_length(state.settings)
+            worker_last_seen_at = get_worker_heartbeat(state.settings)
+        except Exception:  # noqa: BLE001
+            pass
+        return queue_health_response(
+            await get_ingest_queue_health(state.settings, knowledge_base_id),
+            redis_queue_length=redis_queue_length,
+            worker_last_seen_at=worker_last_seen_at,
+        )
+
     @app.get("/ingest-jobs/{job_id}", response_model=IngestJobResponse)
     async def ingest_job_detail(
         job_id: str,
@@ -1174,6 +1239,95 @@ def create_app() -> FastAPI:
             **audit_context(http_request),
         )
         return ingest_job_response(retried)
+
+    @app.post("/ingest-jobs/{job_id}/cancel", response_model=IngestJobResponse)
+    async def cancel_ingest_job_endpoint(
+        http_request: Request,
+        job_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> IngestJobResponse:
+        state = get_state(app)
+        job = await get_ingest_job(state.settings, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Ingest job not found")
+        await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user, write=True)
+        try:
+            cancelled = await cancel_ingest_job(state.settings, job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="ingest.cancel_requested",
+            target_type="ingest_job",
+            target_id=job_id,
+            metadata={"knowledge_base_id": job.knowledge_base_id, "status": job.status},
+            **audit_context(http_request),
+        )
+        return ingest_job_response(cancelled)
+
+    @app.post("/ingest-jobs/actions/batch-retry", response_model=BatchOperationResponse)
+    async def batch_retry_ingest_jobs(
+        http_request: Request,
+        request: IngestJobBatchRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> BatchOperationResponse:
+        state = get_state(app)
+        results: list[BatchItemResult] = []
+        for job_id in request.job_ids:
+            try:
+                job = await get_ingest_job(state.settings, job_id)
+                if job is None:
+                    raise ValueError("Ingest job not found")
+                await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user, write=True)
+                retried = await retry_failed_ingest_job(state.settings, job_id)
+                enqueue_ingest_job(state.settings, job_id)
+                results.append(BatchItemResult(id=job_id, status="succeeded", job_id=retried.id))
+            except Exception as exc:  # noqa: BLE001
+                results.append(BatchItemResult(id=job_id, status="failed", message=str(exc)))
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="ingest.batch_retry_requested",
+            target_type="ingest_job",
+            metadata={"job_count": len(request.job_ids), "failed": sum(1 for item in results if item.status == "failed")},
+            **audit_context(http_request),
+        )
+        return batch_response(results)
+
+    @app.post("/ingest-jobs/actions/batch-cancel", response_model=BatchOperationResponse)
+    async def batch_cancel_ingest_jobs(
+        http_request: Request,
+        request: IngestJobBatchRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> BatchOperationResponse:
+        state = get_state(app)
+        results: list[BatchItemResult] = []
+        for job_id in request.job_ids:
+            try:
+                job = await get_ingest_job(state.settings, job_id)
+                if job is None:
+                    raise ValueError("Ingest job not found")
+                await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user, write=True)
+                cancelled = await cancel_ingest_job(state.settings, job_id)
+                results.append(BatchItemResult(id=job_id, status="succeeded", job_id=cancelled.id))
+            except Exception as exc:  # noqa: BLE001
+                results.append(BatchItemResult(id=job_id, status="failed", message=str(exc)))
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="ingest.batch_cancel_requested",
+            target_type="ingest_job",
+            metadata={"job_count": len(request.job_ids), "failed": sum(1 for item in results if item.status == "failed")},
+            **audit_context(http_request),
+        )
+        return batch_response(results)
 
     @app.get("/knowledge-bases/{knowledge_base_id}/documents", response_model=FileListResponse)
     async def knowledge_base_documents(
@@ -1245,17 +1399,10 @@ def create_app() -> FastAPI:
         item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Document not found")
-        if item.source_type == "file":
-            path = safe_upload_path(state.settings.upload_storage_dir, item.source_uri or "")
-            if path is None or not path.exists():
-                raise HTTPException(status_code=400, detail="Stored source file is missing; upload it again")
-            payload = {"path": str(path), "content_type": item.content_type, "file_size": item.file_size}
-            source_uri = str(path)
-        elif item.source_type == "url":
-            payload = {"url": item.source_uri}
-            source_uri = item.source_uri
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported source type: {item.source_type}")
+        try:
+            payload, source_uri = build_reindex_payload(state.settings, item)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         job = await create_ingest_job(
             state.settings,
             org_id=current_user.org_id,
@@ -1311,6 +1458,82 @@ def create_app() -> FastAPI:
             **audit_context(http_request),
         )
         return DeleteDocumentResponse(file_id=file_id, deleted_vectors=len(item.vector_ids), deleted_chunks=len(item.chunk_ids))
+
+    @app.post("/knowledge-bases/{knowledge_base_id}/documents/batch-delete", response_model=BatchOperationResponse)
+    async def batch_delete_knowledge_base_documents(
+        http_request: Request,
+        knowledge_base_id: str,
+        request: DocumentBatchRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> BatchOperationResponse:
+        state = require_ready(app)
+        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        results: list[BatchItemResult] = []
+        for file_id in request.file_ids:
+            try:
+                item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
+                if item is None:
+                    raise ValueError("Document not found")
+                delete_documents(state.vector_store, item.vector_ids)
+                await delete_file_chunks_by_file_id(state.settings, file_id)
+                await delete_document_artifacts(state.settings, file_id)
+                await mark_file_deleted(state.settings, file_id)
+                results.append(BatchItemResult(id=file_id, status="succeeded"))
+            except Exception as exc:  # noqa: BLE001
+                results.append(BatchItemResult(id=file_id, status="failed", message=str(exc)))
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="document.batch_delete",
+            target_type="document",
+            metadata={"knowledge_base_id": knowledge_base_id, "file_count": len(request.file_ids), "failed": sum(1 for item in results if item.status == "failed")},
+            **audit_context(http_request),
+        )
+        return batch_response(results)
+
+    @app.post("/knowledge-bases/{knowledge_base_id}/documents/batch-reindex", response_model=BatchOperationResponse)
+    async def batch_reindex_knowledge_base_documents(
+        http_request: Request,
+        knowledge_base_id: str,
+        request: DocumentBatchRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> BatchOperationResponse:
+        state = get_state(app)
+        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        results: list[BatchItemResult] = []
+        for file_id in request.file_ids:
+            try:
+                item = await get_knowledge_base_file(state.settings, knowledge_base_id, file_id)
+                if item is None:
+                    raise ValueError("Document not found")
+                payload, source_uri = build_reindex_payload(state.settings, item)
+                job = await create_ingest_job(
+                    state.settings,
+                    org_id=current_user.org_id,
+                    knowledge_base_id=knowledge_base_id,
+                    created_by_user_id=current_user.id,
+                    source_type=item.source_type,
+                    source_uri=source_uri,
+                    filename=item.filename,
+                    payload=payload,
+                )
+                enqueue_ingest_job(state.settings, job.id)
+                results.append(BatchItemResult(id=file_id, status="succeeded", job_id=job.id))
+            except Exception as exc:  # noqa: BLE001
+                results.append(BatchItemResult(id=file_id, status="failed", message=str(exc)))
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="document.batch_reindex_requested",
+            target_type="document",
+            metadata={"knowledge_base_id": knowledge_base_id, "file_count": len(request.file_ids), "failed": sum(1 for item in results if item.status == "failed")},
+            **audit_context(http_request),
+        )
+        return batch_response(results)
 
     @app.get("/documents", response_model=FileListResponse)
     async def documents(
@@ -2176,6 +2399,54 @@ def ingest_job_response(job: IngestJob) -> IngestJobResponse:
     )
 
 
+def batch_response(items: list[BatchItemResult]) -> BatchOperationResponse:
+    failed = sum(1 for item in items if item.status == "failed")
+    return BatchOperationResponse(succeeded=len(items) - failed, failed=failed, items=items)
+
+
+def queue_health_response(
+    health: IngestQueueHealth,
+    *,
+    redis_queue_length: int,
+    worker_last_seen_at: str | None,
+) -> QueueHealthResponse:
+    now = datetime.now(timezone.utc)
+    oldest_pending_wait_seconds = seconds_since(health.oldest_pending_at, now)
+    oldest_running_seconds = seconds_since(health.oldest_running_at, now)
+    worker_seen_seconds = seconds_since(parse_datetime(worker_last_seen_at), now) if worker_last_seen_at else None
+    return QueueHealthResponse(
+        pending_count=health.pending_count,
+        running_count=health.running_count,
+        succeeded_count=health.succeeded_count,
+        failed_count=health.failed_count,
+        cancelled_count=health.cancelled_count,
+        redis_queue_length=redis_queue_length,
+        oldest_pending_at=health.oldest_pending_at.isoformat() if health.oldest_pending_at else None,
+        oldest_pending_wait_seconds=oldest_pending_wait_seconds,
+        oldest_running_at=health.oldest_running_at.isoformat() if health.oldest_running_at else None,
+        oldest_running_seconds=oldest_running_seconds,
+        worker_last_seen_at=worker_last_seen_at,
+        worker_stale=worker_seen_seconds is None or worker_seen_seconds > 90,
+    )
+
+
+def seconds_since(value: datetime | None, now: datetime) -> int | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return max(0, int((now - value).total_seconds()))
+
+
+def parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def require_manager(user: CurrentUser) -> None:
     if not user.is_manager:
         raise HTTPException(status_code=403, detail="Manager or admin role required")
@@ -2212,6 +2483,17 @@ async def require_kb_member_admin(settings: AppSettings, kb_id: str, user: Curre
     if user.is_manager or await is_knowledge_base_owner(settings, kb_id=kb_id, user_id=user.id):
         return
     raise HTTPException(status_code=403, detail="Knowledge base owner or manager role required")
+
+
+def build_reindex_payload(settings: AppSettings, item: RagFile) -> tuple[dict[str, Any], str | None]:
+    if item.source_type == "file":
+        path = safe_upload_path(settings.upload_storage_dir, item.source_uri or "")
+        if path is None or not path.exists():
+            raise ValueError("Stored source file is missing; upload it again")
+        return {"path": str(path), "content_type": item.content_type, "file_size": item.file_size}, str(path)
+    if item.source_type == "url":
+        return {"url": item.source_uri}, item.source_uri
+    raise ValueError(f"Unsupported source type: {item.source_type}")
 
 
 def safe_upload_path(upload_storage_dir: str, source_uri: str) -> Path | None:

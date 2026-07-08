@@ -166,6 +166,8 @@ function KnowledgeWorkspace({ api, user }) {
   const [preview, setPreview] = useState(null);
   const [editingKb, setEditingKb] = useState(null);
   const [fileStatus, setFileStatus] = useState("");
+  const [selectedFileIds, setSelectedFileIds] = useState([]);
+  const [selectedJobIds, setSelectedJobIds] = useState([]);
   const [kbForm] = Form.useForm();
   const [editForm] = Form.useForm();
   const [memberForm] = Form.useForm();
@@ -200,6 +202,12 @@ function KnowledgeWorkspace({ api, user }) {
     enabled: Boolean(activeKb),
     refetchInterval: 5000,
     queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/ingest-jobs`, { params: { status: "history" } })).data.items || [],
+  });
+  const queueHealth = useQuery({
+    queryKey: ["queue-health", activeKb],
+    enabled: Boolean(activeKb),
+    refetchInterval: 5000,
+    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/queue-health`)).data,
   });
   useEffect(() => {
     if (!selectedKb && kbs.data?.[0]?.id) setSelectedKb(kbs.data[0].id);
@@ -259,6 +267,50 @@ function KnowledgeWorkspace({ api, user }) {
     onSuccess: () => {
       refreshKnowledge(queryClient, activeKb);
       message.success("任务已重新入队");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const cancelJob = useMutation({
+    mutationFn: (jobId) => api.post(`/ingest-jobs/${jobId}/cancel`, {}),
+    onSuccess: () => {
+      refreshKnowledge(queryClient, activeKb);
+      message.success("任务已取消");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const batchDeleteDocs = useMutation({
+    mutationFn: (fileIds) => api.post(`/knowledge-bases/${activeKb}/documents/batch-delete`, { file_ids: fileIds }),
+    onSuccess: ({ data }) => {
+      setSelectedFileIds([]);
+      refreshKnowledge(queryClient, activeKb);
+      message.success(`批量删除完成：成功 ${data.succeeded}，失败 ${data.failed}`);
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const batchReindexDocs = useMutation({
+    mutationFn: (fileIds) => api.post(`/knowledge-bases/${activeKb}/documents/batch-reindex`, { file_ids: fileIds }),
+    onSuccess: ({ data }) => {
+      setSelectedFileIds([]);
+      refreshKnowledge(queryClient, activeKb);
+      message.success(`批量重建已入队：成功 ${data.succeeded}，失败 ${data.failed}`);
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const batchRetryJobs = useMutation({
+    mutationFn: (jobIds) => api.post("/ingest-jobs/actions/batch-retry", { job_ids: jobIds }),
+    onSuccess: ({ data }) => {
+      setSelectedJobIds([]);
+      refreshKnowledge(queryClient, activeKb);
+      message.success(`批量重试完成：成功 ${data.succeeded}，失败 ${data.failed}`);
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const batchCancelJobs = useMutation({
+    mutationFn: (jobIds) => api.post("/ingest-jobs/actions/batch-cancel", { job_ids: jobIds }),
+    onSuccess: ({ data }) => {
+      setSelectedJobIds([]);
+      refreshKnowledge(queryClient, activeKb);
+      message.success(`批量取消完成：成功 ${data.succeeded}，失败 ${data.failed}`);
     },
     onError: (error) => message.error(readError(error)),
   });
@@ -373,6 +425,16 @@ function KnowledgeWorkspace({ api, user }) {
             <Tag>{activeKbRecord.visibility}</Tag>
           </div>
         )}
+        {queueHealth.data && (
+          <div className="queue-health">
+            <div><strong>{queueHealth.data.redis_queue_length}</strong><span>Redis 队列</span></div>
+            <div><strong>{queueHealth.data.pending_count}</strong><span>等待</span></div>
+            <div><strong>{queueHealth.data.running_count}</strong><span>运行</span></div>
+            <div><strong>{queueHealth.data.failed_count}</strong><span>失败</span></div>
+            <div><strong>{queueHealth.data.oldest_pending_wait_seconds == null ? "-" : `${queueHealth.data.oldest_pending_wait_seconds}s`}</strong><span>最久等待</span></div>
+            <div><strong className={queueHealth.data.worker_stale ? "danger-text" : ""}>{queueHealth.data.worker_stale ? "异常" : "在线"}</strong><span>Worker</span></div>
+          </div>
+        )}
         <Upload.Dragger {...uploadProps} disabled={!activeKb} className="upload-zone">
           <p><CloudUploadOutlined /></p>
           <p>拖拽或点击上传文档</p>
@@ -385,24 +447,29 @@ function KnowledgeWorkspace({ api, user }) {
         </Form>
         <Flex justify="space-between" align="center" className="table-tools">
           <Typography.Title level={5}>文件</Typography.Title>
-          <Select
-            value={fileStatus}
-            onChange={setFileStatus}
-            style={{ width: 160 }}
-            options={[
-              { value: "", label: "全部文件" },
-              { value: "processing", label: "处理中" },
-              { value: "completed", label: "已完成" },
-              { value: "failed", label: "失败" },
-              { value: "deleted", label: "已删除" },
-            ]}
-          />
+          <Space wrap>
+            <Button disabled={!selectedFileIds.length} icon={<ReloadOutlined />} onClick={() => batchReindexDocs.mutate(selectedFileIds)}>批量重建</Button>
+            <Button disabled={!selectedFileIds.length} danger icon={<DeleteOutlined />} onClick={() => batchDeleteDocs.mutate(selectedFileIds)}>批量删除</Button>
+            <Select
+              value={fileStatus}
+              onChange={setFileStatus}
+              style={{ width: 160 }}
+              options={[
+                { value: "", label: "全部文件" },
+                { value: "processing", label: "处理中" },
+                { value: "completed", label: "已完成" },
+                { value: "failed", label: "失败" },
+                { value: "deleted", label: "已删除" },
+              ]}
+            />
+          </Space>
         </Flex>
         <Table
           rowKey="id"
           size="middle"
           loading={files.isLoading}
           dataSource={files.data || []}
+          rowSelection={{ selectedRowKeys: selectedFileIds, onChange: setSelectedFileIds }}
           columns={[
             { title: "文件", dataIndex: "filename", render: (value, row) => <Space direction="vertical" size={0}><strong>{value}</strong><span className="muted">{row.content_type}</span></Space> },
             { title: "状态", dataIndex: "status", width: 120, render: (value) => <Tag color={value === "completed" ? "green" : value === "failed" ? "red" : "blue"}>{value}</Tag> },
@@ -423,17 +490,21 @@ function KnowledgeWorkspace({ api, user }) {
           ]}
         />
         <Typography.Title level={5}>入库任务</Typography.Title>
+        <Space className="table-tools" wrap>
+          <Button disabled={!selectedJobIds.length} onClick={() => batchRetryJobs.mutate(selectedJobIds)}>批量重试失败</Button>
+          <Button disabled={!selectedJobIds.length} danger onClick={() => batchCancelJobs.mutate(selectedJobIds)}>批量取消</Button>
+        </Space>
         <Tabs
           items={[
             {
               key: "active",
               label: `处理中 ${activeJobs.data?.length || 0}`,
-              children: <JobTable jobs={activeJobs.data || []} loading={activeJobs.isLoading} retryJob={retryJob} />,
+              children: <JobTable jobs={activeJobs.data || []} loading={activeJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} />,
             },
             {
               key: "history",
               label: <span><HistoryOutlined /> 历史 {historyJobs.data?.length || 0}</span>,
-              children: <JobTable jobs={historyJobs.data || []} loading={historyJobs.isLoading} retryJob={retryJob} />,
+              children: <JobTable jobs={historyJobs.data || []} loading={historyJobs.isLoading} retryJob={retryJob} cancelJob={cancelJob} selectedJobIds={selectedJobIds} setSelectedJobIds={setSelectedJobIds} />,
             },
           ]}
         />
@@ -503,7 +574,7 @@ function KnowledgeWorkspace({ api, user }) {
   );
 }
 
-function JobTable({ jobs, loading, retryJob }) {
+function JobTable({ jobs, loading, retryJob, cancelJob, selectedJobIds, setSelectedJobIds }) {
   return (
     <Table
       rowKey="id"
@@ -511,6 +582,7 @@ function JobTable({ jobs, loading, retryJob }) {
       loading={loading}
       pagination={{ pageSize: 6 }}
       dataSource={jobs}
+      rowSelection={{ selectedRowKeys: selectedJobIds, onChange: setSelectedJobIds }}
       columns={[
         { title: "来源", render: (_, row) => row.filename || row.source_uri },
         { title: "状态", dataIndex: "status", width: 120, render: (value) => <Tag color={value === "failed" ? "red" : value === "succeeded" ? "green" : "blue"}>{value}</Tag> },
@@ -520,8 +592,13 @@ function JobTable({ jobs, loading, retryJob }) {
         { title: "错误", dataIndex: "error_message", ellipsis: true },
         {
           title: "操作",
-          width: 90,
-          render: (_, row) => row.status === "failed" ? <Button size="small" onClick={() => retryJob.mutate(row.id)}>重试</Button> : "-",
+          width: 150,
+          render: (_, row) => (
+            <Space>
+              {row.status === "failed" && <Button size="small" onClick={() => retryJob.mutate(row.id)}>重试</Button>}
+              {["pending", "running"].includes(row.status) && <Button size="small" danger onClick={() => cancelJob.mutate(row.id)}>取消</Button>}
+            </Space>
+          ),
         },
       ]}
     />
@@ -1086,6 +1163,7 @@ function buildApi(token) {
 function refreshKnowledge(queryClient, kbId) {
   queryClient.invalidateQueries({ queryKey: ["files", kbId] });
   queryClient.invalidateQueries({ queryKey: ["jobs", kbId] });
+  queryClient.invalidateQueries({ queryKey: ["queue-health", kbId] });
 }
 
 function buildChatRecordsFromMessages(items) {

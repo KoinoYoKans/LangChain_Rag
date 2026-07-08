@@ -11,6 +11,10 @@ from config.database import IngestJobModel, RagFileModel, build_async_session_ma
 from config.settings import AppSettings
 
 
+class IngestJobCancelledError(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class IngestJob:
     id: str
@@ -29,6 +33,17 @@ class IngestJob:
     duration_ms: int | None
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class IngestQueueHealth:
+    pending_count: int
+    running_count: int
+    succeeded_count: int
+    failed_count: int
+    cancelled_count: int
+    oldest_pending_at: datetime | None
+    oldest_running_at: datetime | None
 
 
 async def create_ingest_job(
@@ -105,8 +120,55 @@ async def list_recoverable_ingest_jobs(settings: AppSettings, limit: int = 50) -
         return [_job_to_dataclass(item) for item in result]
 
 
+async def get_ingest_queue_health(settings: AppSettings, knowledge_base_id: str) -> IngestQueueHealth:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        counts: dict[str, int] = {}
+        for status in ("pending", "running", "succeeded", "failed", "cancelled"):
+            value = await session.scalar(
+                select(func.count())
+                .select_from(IngestJobModel)
+                .where(
+                    IngestJobModel.knowledge_base_id == UUID(knowledge_base_id),
+                    IngestJobModel.status == status,
+                )
+            )
+            counts[status] = int(value or 0)
+        oldest_pending_at = await session.scalar(
+            select(func.min(IngestJobModel.created_at)).where(
+                IngestJobModel.knowledge_base_id == UUID(knowledge_base_id),
+                IngestJobModel.status == "pending",
+            )
+        )
+        oldest_running_at = await session.scalar(
+            select(func.min(IngestJobModel.updated_at)).where(
+                IngestJobModel.knowledge_base_id == UUID(knowledge_base_id),
+                IngestJobModel.status == "running",
+            )
+        )
+        return IngestQueueHealth(
+            pending_count=counts["pending"],
+            running_count=counts["running"],
+            succeeded_count=counts["succeeded"],
+            failed_count=counts["failed"],
+            cancelled_count=counts["cancelled"],
+            oldest_pending_at=oldest_pending_at,
+            oldest_running_at=oldest_running_at,
+        )
+
+
 async def mark_job_running(settings: AppSettings, job_id: str) -> None:
-    await _update_job(settings, job_id, status="running", progress=10, error_message=None)
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            job = await session.get(IngestJobModel, UUID(job_id))
+            if job is None:
+                raise ValueError(f"Ingest job not found: {job_id}")
+            if job.status == "cancelled":
+                raise IngestJobCancelledError("Ingest job has been cancelled")
+            job.status = "running"
+            job.progress = max(int(job.progress or 0), 10)
+            job.error_message = None
 
 
 async def mark_job_progress(settings: AppSettings, job_id: str, progress: int) -> None:
@@ -155,6 +217,28 @@ async def retry_failed_ingest_job(settings: AppSettings, job_id: str) -> IngestJ
         return _job_to_dataclass(job)
 
 
+async def cancel_ingest_job(settings: AppSettings, job_id: str) -> IngestJob:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            job = await session.get(IngestJobModel, UUID(job_id))
+            if job is None:
+                raise ValueError(f"Ingest job not found: {job_id}")
+            if job.status not in {"pending", "running"}:
+                raise ValueError("Only pending or running ingest jobs can be cancelled")
+            job.status = "cancelled"
+            job.progress = 100
+            job.error_message = "Cancelled by user"
+            if job.file_id:
+                await session.execute(
+                    update(RagFileModel)
+                    .where(RagFileModel.id == job.file_id, RagFileModel.status.in_(("processing", "failed")))
+                    .values(status="deleted", deleted_at=func.now())
+                )
+        await session.refresh(job)
+        return _job_to_dataclass(job)
+
+
 async def _update_job(settings: AppSettings, job_id: str, **values: Any) -> None:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
@@ -162,6 +246,8 @@ async def _update_job(settings: AppSettings, job_id: str, **values: Any) -> None
             job = await session.get(IngestJobModel, UUID(job_id))
             if job is None:
                 raise ValueError(f"Ingest job not found: {job_id}")
+            if job.status == "cancelled" and values.get("status") != "cancelled":
+                raise IngestJobCancelledError("Ingest job has been cancelled")
             for key, value in values.items():
                 setattr(job, key, value)
 

@@ -412,6 +412,13 @@ async def _migrate_existing_tables(connection: Any, settings: AppSettings) -> No
     await connection.execute(text(f'alter table "{file_table}" add column if not exists source_type text not null default \'file\''))
     await connection.execute(text(f'alter table "{file_table}" add column if not exists source_uri text'))
     await connection.execute(text(f'alter table "{file_table}" add column if not exists deleted_at timestamp with time zone'))
+    await connection.execute(text(f'alter table "{file_table}" drop constraint if exists "rag_files_status_check"'))
+    await connection.execute(
+        text(
+            f'alter table "{file_table}" add constraint "rag_files_status_check" '
+            "check (status in ('processing', 'completed', 'failed', 'deleted'))"
+        )
+    )
 
     await connection.execute(text(f'alter table "{chunk_table}" add column if not exists user_id text not null default \'default\''))
     await connection.execute(text(f'alter table "{chunk_table}" add column if not exists keywords text[] not null default \'{{}}\''))

@@ -186,6 +186,36 @@ body {
   margin-bottom: 14px;
 }
 
+.queue-health {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(90px, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.queue-health div {
+  display: grid;
+  gap: 2px;
+  border: 1px solid #dce3ee;
+  border-radius: 8px;
+  background: #f9fbfd;
+  padding: 10px;
+}
+
+.queue-health strong {
+  color: #172033;
+  font-size: 18px;
+}
+
+.queue-health span {
+  color: #66758a;
+  font-size: 12px;
+}
+
+.danger-text {
+  color: #dc2626 !important;
+}
+
 .upload-zone .anticon {
   color: #2563eb;
   font-size: 28px;
@@ -315,5 +345,9 @@ body {
   .grow,
   .kb-select {
     min-width: 100%;
+  }
+
+  .queue-health {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
