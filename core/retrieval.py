@@ -34,8 +34,39 @@ async def hybrid_search(
         user_id=user_id,
         knowledge_base_id=knowledge_base_id,
     )
+    vector_docs = await _filter_completed_vector_documents(settings, vector_docs, knowledge_base_id=knowledge_base_id)
     bm25_docs = await _bm25_search(settings, query, knowledge_base_id=knowledge_base_id, limit=max(top_k * 2, top_k))
     return RetrievalResult(documents=_rrf_merge(vector_docs, bm25_docs, top_k=top_k), rewritten_query=query)
+
+
+async def _filter_completed_vector_documents(
+    settings: AppSettings,
+    documents: list[Document],
+    *,
+    knowledge_base_id: str,
+) -> list[Document]:
+    file_ids = {
+        str(document.metadata.get("file_id"))
+        for document in documents
+        if document.metadata.get("file_id")
+    }
+    if not file_ids:
+        return []
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        rows = await session.scalars(
+            select(RagFileModel.id).where(
+                RagFileModel.knowledge_base_id == UUID(knowledge_base_id),
+                RagFileModel.status == "completed",
+                RagFileModel.id.in_([UUID(file_id) for file_id in file_ids]),
+            )
+        )
+        completed_ids = {str(item) for item in rows}
+    return [
+        document
+        for document in documents
+        if str(document.metadata.get("file_id")) in completed_ids
+    ]
 
 
 async def _bm25_search(settings: AppSettings, query: str, *, knowledge_base_id: str, limit: int) -> list[Document]:

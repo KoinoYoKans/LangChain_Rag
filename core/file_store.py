@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy import update as sqlalchemy_update
 from sqlalchemy.dialects.postgresql import insert
 
@@ -210,20 +210,35 @@ async def list_knowledge_base_files(
     knowledge_base_id: str,
     limit: int = 50,
     offset: int = 0,
+    status: str | None = None,
+    include_deleted: bool = False,
 ) -> list[RagFile]:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
+        conditions = [RagFileModel.knowledge_base_id == UUID(knowledge_base_id)]
+        if status:
+            conditions.append(RagFileModel.status == status)
+        elif not include_deleted:
+            conditions.append(RagFileModel.status != "deleted")
         result = await session.scalars(
             select(RagFileModel)
-            .where(
-                RagFileModel.knowledge_base_id == UUID(knowledge_base_id),
-                RagFileModel.status != "deleted",
-            )
+            .where(*conditions)
             .order_by(RagFileModel.created_at.desc())
             .limit(limit)
             .offset(offset)
         )
         return [_model_to_file(item) for item in result]
+
+
+async def count_completed_knowledge_base_files(settings: AppSettings, knowledge_base_id: str) -> int:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(RagFileModel)
+            .where(RagFileModel.knowledge_base_id == UUID(knowledge_base_id), RagFileModel.status == "completed")
+        )
+        return int(count or 0)
 
 
 async def get_file(settings: AppSettings, user_id: str, file_id: str) -> RagFile | None:

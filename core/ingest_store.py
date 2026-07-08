@@ -5,9 +5,9 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 
-from config.database import IngestJobModel, build_async_session_maker
+from config.database import IngestJobModel, RagFileModel, build_async_session_maker
 from config.settings import AppSettings
 
 
@@ -26,6 +26,7 @@ class IngestJob:
     retry_count: int
     payload: dict[str, Any]
     file_id: str | None
+    duration_ms: int | None
     created_at: datetime
     updated_at: datetime
 
@@ -68,12 +69,24 @@ async def get_ingest_job(settings: AppSettings, job_id: str) -> IngestJob | None
         return _job_to_dataclass(job) if job else None
 
 
-async def list_ingest_jobs(settings: AppSettings, knowledge_base_id: str, limit: int = 100) -> list[IngestJob]:
+async def list_ingest_jobs(
+    settings: AppSettings,
+    knowledge_base_id: str,
+    limit: int = 100,
+    status: str = "all",
+) -> list[IngestJob]:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
+        conditions = [IngestJobModel.knowledge_base_id == UUID(knowledge_base_id)]
+        if status == "active":
+            conditions.append(IngestJobModel.status.in_(("pending", "running")))
+        elif status == "history":
+            conditions.append(IngestJobModel.status.in_(("succeeded", "failed", "cancelled")))
+        elif status != "all":
+            conditions.append(IngestJobModel.status == status)
         result = await session.scalars(
             select(IngestJobModel)
-            .where(IngestJobModel.knowledge_base_id == UUID(knowledge_base_id))
+            .where(*conditions)
             .order_by(IngestJobModel.created_at.desc())
             .limit(limit)
         )
@@ -100,21 +113,46 @@ async def mark_job_progress(settings: AppSettings, job_id: str, progress: int) -
     await _update_job(settings, job_id, progress=max(0, min(progress, 99)))
 
 
+async def mark_job_file_id(settings: AppSettings, job_id: str, file_id: str) -> None:
+    await _update_job(settings, job_id, file_id=UUID(file_id))
+
+
 async def mark_job_succeeded(settings: AppSettings, job_id: str, *, file_id: str, progress: int = 100) -> None:
     await _update_job(settings, job_id, status="succeeded", progress=progress, file_id=UUID(file_id))
 
 
 async def mark_job_failed(settings: AppSettings, job_id: str, error_message: str) -> None:
-    job = await get_ingest_job(settings, job_id)
-    retry_count = (job.retry_count + 1) if job else 1
     await _update_job(
         settings,
         job_id,
         status="failed",
         progress=100,
         error_message=error_message[:4000],
-        retry_count=retry_count,
     )
+
+
+async def retry_failed_ingest_job(settings: AppSettings, job_id: str) -> IngestJob:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            job = await session.get(IngestJobModel, UUID(job_id))
+            if job is None:
+                raise ValueError(f"Ingest job not found: {job_id}")
+            if job.status != "failed":
+                raise ValueError("Only failed ingest jobs can be retried")
+            if job.file_id:
+                await session.execute(
+                    update(RagFileModel)
+                    .where(RagFileModel.id == job.file_id, RagFileModel.status == "failed")
+                    .values(status="deleted", deleted_at=func.now())
+                )
+            job.status = "pending"
+            job.progress = 0
+            job.error_message = None
+            job.retry_count = int(job.retry_count or 0) + 1
+            job.file_id = None
+        await session.refresh(job)
+        return _job_to_dataclass(job)
 
 
 async def _update_job(settings: AppSettings, job_id: str, **values: Any) -> None:
@@ -129,6 +167,9 @@ async def _update_job(settings: AppSettings, job_id: str, **values: Any) -> None
 
 
 def _job_to_dataclass(model: IngestJobModel) -> IngestJob:
+    duration_ms = None
+    if model.created_at and model.updated_at and model.status in {"succeeded", "failed", "cancelled"}:
+        duration_ms = max(0, int((model.updated_at - model.created_at).total_seconds() * 1000))
     return IngestJob(
         id=str(model.id),
         org_id=str(model.org_id),
@@ -143,6 +184,7 @@ def _job_to_dataclass(model: IngestJobModel) -> IngestJob:
         retry_count=int(model.retry_count),
         payload=dict(model.payload or {}),
         file_id=str(model.file_id) if model.file_id else None,
+        duration_ms=duration_ms,
         created_at=model.created_at,
         updated_at=model.updated_at,
     )

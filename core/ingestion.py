@@ -10,18 +10,19 @@ from uuid import uuid4
 from config.settings import AppSettings
 from core.document_loader import build_chunks_from_text, hash_bytes, hash_text
 from core.document_parser import locate_chunk, parse_document, parse_html
-from core.document_store import replace_chunk_locations, replace_document_pages
+from core.document_store import delete_document_artifacts, replace_chunk_locations, replace_document_pages
 from core.embeddings import build_embeddings
 from core.enterprise_store import add_audit_log
 from core.file_store import (
     create_processing_file,
     find_file_by_content_hash,
+    delete_file_chunks_by_file_id,
     mark_file_completed,
     mark_file_failed,
     save_file_chunks,
 )
-from core.ingest_store import get_ingest_job, mark_job_failed, mark_job_progress, mark_job_running, mark_job_succeeded
-from core.vector_store import add_documents, build_vector_store, initialize_vector_extension
+from core.ingest_store import get_ingest_job, mark_job_failed, mark_job_file_id, mark_job_progress, mark_job_running, mark_job_succeeded
+from core.vector_store import add_documents, build_vector_store, delete_documents, initialize_vector_extension
 
 
 async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
@@ -30,6 +31,8 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
         raise ValueError(f"Ingest job not found: {job_id}")
     await mark_job_running(settings, job_id)
     file_id = str(uuid4())
+    vector_store = None
+    ids: list[str] = []
     try:
         source = _load_job_source(job.payload, job.source_type, job.source_uri, job.filename)
         parsed = source["parsed"]
@@ -60,6 +63,7 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
             file_sha256=hash_bytes(source["raw_bytes"]),
             content_sha256=content_sha256,
         )
+        await mark_job_file_id(settings, job_id, file_id)
         _, documents = build_chunks_from_text(
             filename=source["filename"],
             content_type=source["content_type"],
@@ -132,6 +136,16 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
             metadata={"file_id": file_id, "source_type": job.source_type},
         )
     except Exception as exc:  # noqa: BLE001
+        if vector_store is not None and ids:
+            try:
+                delete_documents(vector_store, ids)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await delete_file_chunks_by_file_id(settings, file_id)
+            await delete_document_artifacts(settings, file_id)
+        except Exception:  # noqa: BLE001
+            pass
         await mark_file_failed(settings, file_id, str(exc))
         await mark_job_failed(settings, job_id, str(exc))
         await add_audit_log(

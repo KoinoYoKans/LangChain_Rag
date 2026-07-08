@@ -68,7 +68,13 @@ class UserModel(Base):
 class KnowledgeBaseModel(Base):
     __tablename__ = os.getenv("KNOWLEDGE_BASE_TABLE", "rag_knowledge_bases")
     __table_args__ = (
-        Index("rag_knowledge_bases_org_name_uidx", "org_id", "name", unique=True),
+        Index(
+            "rag_knowledge_bases_org_name_uidx",
+            "org_id",
+            "name",
+            unique=True,
+            postgresql_where=text("status != 'deleted'"),
+        ),
     )
 
     id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
@@ -78,6 +84,8 @@ class KnowledgeBaseModel(Base):
     description: Mapped[str | None] = mapped_column(Text)
     visibility: Mapped[str] = mapped_column(String, nullable=False, default="department")
     department_ids: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -362,6 +370,17 @@ async def _migrate_existing_tables(connection: Any, settings: AppSettings) -> No
     for table_name in (file_table, chunk_table, conversation_table, message_table):
         await connection.execute(text(f'alter table "{table_name}" add column if not exists org_id uuid'))
         await connection.execute(text(f'alter table "{table_name}" add column if not exists knowledge_base_id uuid'))
+
+    await connection.execute(text('alter table "rag_knowledge_bases" add column if not exists status text not null default \'active\''))
+    await connection.execute(text('alter table "rag_knowledge_bases" add column if not exists deleted_at timestamp with time zone'))
+    await connection.execute(text('drop index if exists "rag_knowledge_bases_org_name_uidx"'))
+    await connection.execute(
+        text(
+            'create unique index if not exists "rag_knowledge_bases_org_name_uidx" '
+            'on "rag_knowledge_bases" (org_id, name) '
+            "where status != 'deleted'"
+        )
+    )
 
     await connection.execute(text(f'alter table "{file_table}" add column if not exists owner_user_id uuid'))
     await connection.execute(text(f'alter table "{file_table}" add column if not exists chunk_ids text[] not null default \'{{}}\''))

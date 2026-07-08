@@ -6,8 +6,10 @@ import {
   BankOutlined,
   CloudUploadOutlined,
   DeleteOutlined,
+  EditOutlined,
   EyeOutlined,
   FileSearchOutlined,
+  HistoryOutlined,
   KeyOutlined,
   MessageOutlined,
   ReloadOutlined,
@@ -28,6 +30,7 @@ import {
   Progress,
   Select,
   Space,
+  Switch,
   Table,
   Tabs,
   Tag,
@@ -114,7 +117,7 @@ function Shell() {
         </div>
       </Layout.Sider>
       <Layout.Content className="workspace">
-        {page === "knowledge" && <KnowledgeWorkspace api={api} />}
+        {page === "knowledge" && <KnowledgeWorkspace api={api} user={user} />}
         {page === "chat" && <ChatWorkspace api={api} />}
         {page === "users" && <UsersWorkspace api={api} user={user} />}
         {page === "api" && <ApiKeyWorkspace api={api} />}
@@ -155,24 +158,46 @@ function Login({ onLogin }) {
   );
 }
 
-function KnowledgeWorkspace({ api }) {
+function KnowledgeWorkspace({ api, user }) {
   const queryClient = useQueryClient();
   const [selectedKb, setSelectedKb] = useState("");
   const [preview, setPreview] = useState(null);
+  const [editingKb, setEditingKb] = useState(null);
+  const [fileStatus, setFileStatus] = useState("");
   const [kbForm] = Form.useForm();
+  const [editForm] = Form.useForm();
+  const [memberForm] = Form.useForm();
   const [urlForm] = Form.useForm();
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
-  const activeKb = selectedKb || kbs.data?.[0]?.id || "";
-  const files = useQuery({
-    queryKey: ["files", activeKb],
-    enabled: Boolean(activeKb),
-    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/documents`)).data.items || [],
+  const departments = useQuery({ queryKey: ["departments"], queryFn: async () => (await api.get("/departments")).data.items || [] });
+  const users = useQuery({
+    queryKey: ["users"],
+    enabled: user?.role !== "member",
+    queryFn: async () => (await api.get("/users")).data.items || [],
   });
-  const jobs = useQuery({
-    queryKey: ["jobs", activeKb],
+  const activeKb = selectedKb || kbs.data?.[0]?.id || "";
+  const activeKbRecord = (kbs.data || []).find((item) => item.id === activeKb);
+  const members = useQuery({
+    queryKey: ["kb-members", activeKb],
+    enabled: Boolean(activeKb),
+    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/members`)).data.items || [],
+  });
+  const files = useQuery({
+    queryKey: ["files", activeKb, fileStatus],
+    enabled: Boolean(activeKb),
+    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/documents`, { params: fileStatus ? { status: fileStatus } : {} })).data.items || [],
+  });
+  const activeJobs = useQuery({
+    queryKey: ["jobs", activeKb, "active"],
     enabled: Boolean(activeKb),
     refetchInterval: 2500,
-    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/ingest-jobs`)).data.items || [],
+    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/ingest-jobs`, { params: { status: "active" } })).data.items || [],
+  });
+  const historyJobs = useQuery({
+    queryKey: ["jobs", activeKb, "history"],
+    enabled: Boolean(activeKb),
+    refetchInterval: 5000,
+    queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/ingest-jobs`, { params: { status: "history" } })).data.items || [],
   });
   useEffect(() => {
     if (!selectedKb && kbs.data?.[0]?.id) setSelectedKb(kbs.data[0].id);
@@ -184,6 +209,24 @@ function KnowledgeWorkspace({ api }) {
       kbForm.resetFields();
       queryClient.invalidateQueries({ queryKey: ["kbs"] });
       message.success("知识库已创建");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const updateKb = useMutation({
+    mutationFn: ({ id, values }) => api.patch(`/knowledge-bases/${id}`, values),
+    onSuccess: () => {
+      setEditingKb(null);
+      queryClient.invalidateQueries({ queryKey: ["kbs"] });
+      message.success("知识库已更新");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const deleteKb = useMutation({
+    mutationFn: (id) => api.delete(`/knowledge-bases/${id}`),
+    onSuccess: () => {
+      setSelectedKb("");
+      queryClient.invalidateQueries({ queryKey: ["kbs"] });
+      message.success("知识库已删除");
     },
     onError: (error) => message.error(readError(error)),
   });
@@ -209,6 +252,33 @@ function KnowledgeWorkspace({ api }) {
     },
     onError: (error) => message.error(readError(error)),
   });
+  const retryJob = useMutation({
+    mutationFn: (jobId) => api.post(`/ingest-jobs/${jobId}/retry`, {}),
+    onSuccess: () => {
+      refreshKnowledge(queryClient, activeKb);
+      message.success("任务已重新入队");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const upsertMember = useMutation({
+    mutationFn: (values) => api.put(`/knowledge-bases/${activeKb}/members`, values),
+    onSuccess: () => {
+      memberForm.resetFields();
+      queryClient.invalidateQueries({ queryKey: ["kb-members", activeKb] });
+      queryClient.invalidateQueries({ queryKey: ["kbs"] });
+      message.success("成员权限已保存");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const removeMember = useMutation({
+    mutationFn: (userId) => api.delete(`/knowledge-bases/${activeKb}/members/${userId}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["kb-members", activeKb] });
+      queryClient.invalidateQueries({ queryKey: ["kbs"] });
+      message.success("成员已移除");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
 
   const uploadProps = {
     multiple: true,
@@ -228,6 +298,27 @@ function KnowledgeWorkspace({ api }) {
     },
   };
 
+  function openEditKb(item) {
+    setEditingKb(item);
+    editForm.setFieldsValue({
+      name: item.name,
+      description: item.description,
+      visibility: item.visibility,
+      department_ids: item.department_ids || [],
+    });
+  }
+
+  function confirmDeleteKb(item) {
+    Modal.confirm({
+      title: `删除知识库「${item.name}」？`,
+      content: "删除后该知识库、文件、任务和 API Key 会从工作台隐藏，数据采用软删除。",
+      okText: "删除",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: () => deleteKb.mutate(item.id),
+    });
+  }
+
   return (
     <section className="page-grid">
       <div className="surface narrow">
@@ -242,22 +333,44 @@ function KnowledgeWorkspace({ api }) {
           <Form.Item name="visibility" label="可见范围" initialValue="department">
             <Select options={[{ value: "department", label: "部门" }, { value: "org", label: "全组织" }, { value: "private", label: "私有" }]} />
           </Form.Item>
+          <Form.Item name="department_ids" label="授权部门">
+            <Select mode="multiple" allowClear options={(departments.data || []).map((item) => ({ value: item.id, label: item.name }))} />
+          </Form.Item>
           <Button type="primary" htmlType="submit" loading={createKb.isPending}>创建知识库</Button>
         </Form>
         <div className="kb-list">
           {(kbs.data || []).map((item) => (
-            <button className={activeKb === item.id ? "kb-item active" : "kb-item"} key={item.id} onClick={() => setSelectedKb(item.id)}>
-              <strong>{item.name}</strong>
-              <span>{item.visibility} · {item.id.slice(0, 8)}</span>
-            </button>
+            <div className={activeKb === item.id ? "kb-item active" : "kb-item"} key={item.id} onClick={() => setSelectedKb(item.id)}>
+              <Flex justify="space-between" align="start" gap={8}>
+                <div>
+                  <strong>{item.name}</strong>
+                  <span>{item.visibility} · {item.completed_file_count}/{item.file_count} 文件 · {item.failed_job_count} 失败</span>
+                </div>
+                <Space onClick={(event) => event.stopPropagation()}>
+                  <Button size="small" icon={<EditOutlined />} onClick={() => openEditKb(item)} />
+                  <Button size="small" danger icon={<DeleteOutlined />} onClick={() => confirmDeleteKb(item)} />
+                </Space>
+              </Flex>
+            </div>
           ))}
         </div>
       </div>
       <div className="surface main">
         <Flex justify="space-between" align="center" gap={12}>
-          <PageTitle title="文档管理" subtitle="支持文本、Markdown、HTML、Word、PDF 解析，PDF 可回看页文本和块定位。" />
+          <PageTitle
+            title={activeKbRecord ? `${activeKbRecord.name} · 文档管理` : "文档管理"}
+            subtitle={activeKbRecord?.description || "支持文本、Markdown、HTML、Word、PDF 解析，PDF 可回看页文本和块定位。"}
+          />
           <Button icon={<ReloadOutlined />} onClick={() => refreshKnowledge(queryClient, activeKb)}>刷新</Button>
         </Flex>
+        {activeKbRecord && (
+          <div className="stats-row">
+            <Tag color="blue">文件 {activeKbRecord.file_count}</Tag>
+            <Tag color="green">已完成 {activeKbRecord.completed_file_count}</Tag>
+            <Tag color={activeKbRecord.failed_job_count ? "red" : "default"}>失败任务 {activeKbRecord.failed_job_count}</Tag>
+            <Tag>{activeKbRecord.visibility}</Tag>
+          </div>
+        )}
         <Upload.Dragger {...uploadProps} disabled={!activeKb} className="upload-zone">
           <p><CloudUploadOutlined /></p>
           <p>拖拽或点击上传文档</p>
@@ -268,6 +381,21 @@ function KnowledgeWorkspace({ api }) {
           </Form.Item>
           <Button type="primary" htmlType="submit" loading={ingestUrl.isPending}>导入 URL</Button>
         </Form>
+        <Flex justify="space-between" align="center" className="table-tools">
+          <Typography.Title level={5}>文件</Typography.Title>
+          <Select
+            value={fileStatus}
+            onChange={setFileStatus}
+            style={{ width: 160 }}
+            options={[
+              { value: "", label: "全部文件" },
+              { value: "processing", label: "处理中" },
+              { value: "completed", label: "已完成" },
+              { value: "failed", label: "失败" },
+              { value: "deleted", label: "已删除" },
+            ]}
+          />
+        </Flex>
         <Table
           rowKey="id"
           size="middle"
@@ -277,6 +405,7 @@ function KnowledgeWorkspace({ api }) {
             { title: "文件", dataIndex: "filename", render: (value, row) => <Space direction="vertical" size={0}><strong>{value}</strong><span className="muted">{row.content_type}</span></Space> },
             { title: "状态", dataIndex: "status", width: 120, render: (value) => <Tag color={value === "completed" ? "green" : value === "failed" ? "red" : "blue"}>{value}</Tag> },
             { title: "分块", dataIndex: "chunk_count", width: 90 },
+            { title: "错误", dataIndex: "error_message", ellipsis: true },
             { title: "更新时间", dataIndex: "updated_at", width: 190, render: formatTime },
             {
               title: "操作",
@@ -292,21 +421,108 @@ function KnowledgeWorkspace({ api }) {
           ]}
         />
         <Typography.Title level={5}>入库任务</Typography.Title>
+        <Tabs
+          items={[
+            {
+              key: "active",
+              label: `处理中 ${activeJobs.data?.length || 0}`,
+              children: <JobTable jobs={activeJobs.data || []} loading={activeJobs.isLoading} retryJob={retryJob} />,
+            },
+            {
+              key: "history",
+              label: <span><HistoryOutlined /> 历史 {historyJobs.data?.length || 0}</span>,
+              children: <JobTable jobs={historyJobs.data || []} loading={historyJobs.isLoading} retryJob={retryJob} />,
+            },
+          ]}
+        />
+        <Typography.Title level={5}>成员权限</Typography.Title>
+        <Form form={memberForm} layout="inline" className="url-form" onFinish={(values) => upsertMember.mutate(values)}>
+          <Form.Item name="user_id" rules={[{ required: true }]} className="kb-select">
+            <Select
+              showSearch
+              placeholder="选择用户"
+              optionFilterProp="label"
+              options={(users.data || []).map((item) => ({ value: item.id, label: `${item.display_name} · ${item.email}` }))}
+            />
+          </Form.Item>
+          <Form.Item name="role" rules={[{ required: true }]} initialValue="viewer">
+            <Select style={{ width: 140 }} options={[
+              { value: "viewer", label: "viewer" },
+              { value: "editor", label: "editor" },
+              { value: "owner", label: "owner" },
+            ]} />
+          </Form.Item>
+          <Button type="primary" htmlType="submit" loading={upsertMember.isPending}>授权</Button>
+        </Form>
         <Table
-          rowKey="id"
+          rowKey="user_id"
           size="small"
+          loading={members.isLoading}
           pagination={false}
-          dataSource={jobs.data || []}
+          dataSource={members.data || []}
           columns={[
-            { title: "来源", render: (_, row) => row.filename || row.source_uri },
-            { title: "状态", dataIndex: "status", width: 120, render: (value) => <Tag>{value}</Tag> },
-            { title: "进度", dataIndex: "progress", width: 180, render: (value) => <Progress percent={value} size="small" /> },
-            { title: "错误", dataIndex: "error_message" },
+            { title: "成员", render: (_, row) => <Space direction="vertical" size={0}><strong>{row.display_name}</strong><span className="muted">{row.email}</span></Space> },
+            { title: "角色", dataIndex: "role", width: 120, render: (value) => <Tag color={value === "owner" ? "purple" : value === "editor" ? "blue" : "default"}>{value}</Tag> },
+            { title: "部门", dataIndex: "department_id", width: 120, render: (value) => value?.slice(0, 8) || "-" },
+            { title: "加入时间", dataIndex: "created_at", width: 180, render: formatTime },
+            {
+              title: "操作",
+              width: 90,
+              render: (_, row) => row.role === "owner" ? "-" : <Button size="small" danger onClick={() => removeMember.mutate(row.user_id)}>移除</Button>,
+            },
           ]}
         />
       </div>
       <DocumentPreview api={api} kbId={activeKb} file={preview} onClose={() => setPreview(null)} />
+      <Modal
+        title="编辑知识库"
+        open={Boolean(editingKb)}
+        onCancel={() => setEditingKb(null)}
+        okText="保存"
+        confirmLoading={updateKb.isPending}
+        onOk={() => editForm.validateFields().then((values) => updateKb.mutate({ id: editingKb.id, values }))}
+      >
+        <Form form={editForm} layout="vertical">
+          <Form.Item name="name" label="名称" rules={[{ required: true }]}>
+            <Input />
+          </Form.Item>
+          <Form.Item name="description" label="描述">
+            <Input.TextArea rows={3} />
+          </Form.Item>
+          <Form.Item name="visibility" label="可见范围" rules={[{ required: true }]}>
+            <Select options={[{ value: "department", label: "部门" }, { value: "org", label: "全组织" }, { value: "private", label: "私有" }]} />
+          </Form.Item>
+          <Form.Item name="department_ids" label="授权部门">
+            <Select mode="multiple" allowClear options={(departments.data || []).map((item) => ({ value: item.id, label: item.name }))} />
+          </Form.Item>
+        </Form>
+      </Modal>
     </section>
+  );
+}
+
+function JobTable({ jobs, loading, retryJob }) {
+  return (
+    <Table
+      rowKey="id"
+      size="small"
+      loading={loading}
+      pagination={{ pageSize: 6 }}
+      dataSource={jobs}
+      columns={[
+        { title: "来源", render: (_, row) => row.filename || row.source_uri },
+        { title: "状态", dataIndex: "status", width: 120, render: (value) => <Tag color={value === "failed" ? "red" : value === "succeeded" ? "green" : "blue"}>{value}</Tag> },
+        { title: "进度", dataIndex: "progress", width: 170, render: (value) => <Progress percent={value} size="small" /> },
+        { title: "耗时", dataIndex: "duration_ms", width: 100, render: (value) => value == null ? "-" : `${Math.round(value / 1000)}s` },
+        { title: "更新时间", dataIndex: "updated_at", width: 180, render: formatTime },
+        { title: "错误", dataIndex: "error_message", ellipsis: true },
+        {
+          title: "操作",
+          width: 90,
+          render: (_, row) => row.status === "failed" ? <Button size="small" onClick={() => retryJob.mutate(row.id)}>重试</Button> : "-",
+        },
+      ]}
+    />
   );
 }
 
@@ -373,6 +589,8 @@ function ChatWorkspace({ api }) {
   const [messages, setMessages] = useState([]);
   const [form] = Form.useForm();
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
+  const activeKbRecord = (kbs.data || []).find((item) => item.id === kbId);
+  const canAsk = Boolean(kbId && (activeKbRecord?.completed_file_count || 0) > 0);
   useEffect(() => {
     if (!kbId && kbs.data?.[0]?.id) setKbId(kbs.data[0].id);
   }, [kbs.data, kbId]);
@@ -388,12 +606,15 @@ function ChatWorkspace({ api }) {
   return (
     <section className="surface full">
       <PageTitle title="知识库问答" subtitle="多轮改写、混合检索、重排和引用来源会一起参与回答。" />
+      {activeKbRecord && !canAsk && (
+        <div className="empty-text compact">当前知识库还没有完成入库的文档，请先上传并等待处理完成。</div>
+      )}
       <Form form={form} layout="inline" className="chat-form" onFinish={(values) => ask.mutate(values)}>
         <Form.Item className="kb-select">
-          <Select value={kbId} onChange={setKbId} options={(kbs.data || []).map((item) => ({ value: item.id, label: item.name }))} />
+          <Select value={kbId} onChange={(value) => { setKbId(value); setConversationId(""); setMessages([]); }} options={(kbs.data || []).map((item) => ({ value: item.id, label: `${item.name} (${item.completed_file_count || 0})` }))} />
         </Form.Item>
         <Form.Item name="message" rules={[{ required: true }]} className="grow">
-          <Input.Search placeholder="输入问题" enterButton="发送" loading={ask.isPending} />
+          <Input.Search placeholder="输入问题" enterButton="发送" loading={ask.isPending} disabled={!canAsk} />
         </Form.Item>
       </Form>
       <div className="answer-list">
@@ -425,6 +646,10 @@ function UsersWorkspace({ api, user }) {
   const queryClient = useQueryClient();
   const [deptForm] = Form.useForm();
   const [userForm] = Form.useForm();
+  const [editForm] = Form.useForm();
+  const [passwordForm] = Form.useForm();
+  const [editingUser, setEditingUser] = useState(null);
+  const [resettingUser, setResettingUser] = useState(null);
   const departments = useQuery({ queryKey: ["departments"], queryFn: async () => (await api.get("/departments")).data.items || [] });
   const users = useQuery({ queryKey: ["users"], enabled: user?.role !== "member", queryFn: async () => (await api.get("/users")).data.items || [] });
   const createDept = useMutation({
@@ -443,6 +668,54 @@ function UsersWorkspace({ api, user }) {
     },
     onError: (error) => message.error(readError(error)),
   });
+  const updateUserMutation = useMutation({
+    mutationFn: ({ id, values }) => api.patch(`/users/${id}`, { ...values, department_id: values.department_id || null }),
+    onSuccess: () => {
+      setEditingUser(null);
+      queryClient.invalidateQueries({ queryKey: ["users"] });
+      message.success("用户已更新");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const resetPasswordMutation = useMutation({
+    mutationFn: ({ id, password }) => api.post(`/users/${id}/reset-password`, { password }),
+    onSuccess: () => {
+      setResettingUser(null);
+      passwordForm.resetFields();
+      message.success("密码已重置");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const deactivateUserMutation = useMutation({
+    mutationFn: (id) => api.delete(`/users/${id}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["users"] });
+      message.success("用户已禁用");
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+
+  function openEditUser(row) {
+    setEditingUser(row);
+    editForm.setFieldsValue({
+      display_name: row.display_name,
+      role: row.role,
+      department_id: row.department_id || undefined,
+      is_active: row.is_active,
+    });
+  }
+
+  function confirmDeactivate(row) {
+    Modal.confirm({
+      title: `禁用用户「${row.display_name}」？`,
+      content: "禁用后该用户不能再登录，已有 token 下次校验会失效。",
+      okText: "禁用",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: () => deactivateUserMutation.mutate(row.id),
+    });
+  }
+
   return (
     <section className="page-grid">
       <div className="surface narrow">
@@ -470,12 +743,61 @@ function UsersWorkspace({ api, user }) {
           columns={[
             { title: "用户", render: (_, row) => <Space direction="vertical" size={0}><strong>{row.display_name}</strong><span className="muted">{row.email}</span></Space> },
             { title: "角色", dataIndex: "role", render: (value) => <Tag color={value === "admin" ? "red" : value === "manager" ? "gold" : "blue"}>{value}</Tag> },
+            { title: "状态", dataIndex: "is_active", render: (value) => <Tag color={value ? "green" : "red"}>{value ? "active" : "disabled"}</Tag> },
             { title: "部门", dataIndex: "department_id", render: (value) => departments.data?.find((item) => item.id === value)?.name || value?.slice(0, 8) || "-" },
             { title: "最近登录", dataIndex: "last_login_at", render: formatTime },
             { title: "创建时间", dataIndex: "created_at", render: formatTime },
+            {
+              title: "操作",
+              width: 220,
+              render: (_, row) => (
+                <Space>
+                  <Button size="small" icon={<EditOutlined />} onClick={() => openEditUser(row)}>编辑</Button>
+                  <Button size="small" onClick={() => setResettingUser(row)}>重置密码</Button>
+                  <Button size="small" danger disabled={!row.is_active || row.id === user?.id} onClick={() => confirmDeactivate(row)}>禁用</Button>
+                </Space>
+              ),
+            },
           ]}
         />
       </div>
+      <Modal
+        title="编辑用户"
+        open={Boolean(editingUser)}
+        onCancel={() => setEditingUser(null)}
+        okText="保存"
+        confirmLoading={updateUserMutation.isPending}
+        onOk={() => editForm.validateFields().then((values) => updateUserMutation.mutate({ id: editingUser.id, values }))}
+      >
+        <Form form={editForm} layout="vertical">
+          <Form.Item name="display_name" label="姓名" rules={[{ required: true }]}>
+            <Input />
+          </Form.Item>
+          <Form.Item name="role" label="角色" rules={[{ required: true }]}>
+            <Select options={["member", "manager", "admin"].map((value) => ({ value, label: value }))} />
+          </Form.Item>
+          <Form.Item name="department_id" label="部门">
+            <Select allowClear options={(departments.data || []).map((item) => ({ value: item.id, label: item.name }))} />
+          </Form.Item>
+          <Form.Item name="is_active" label="启用" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+        </Form>
+      </Modal>
+      <Modal
+        title={`重置密码${resettingUser ? ` · ${resettingUser.display_name}` : ""}`}
+        open={Boolean(resettingUser)}
+        onCancel={() => setResettingUser(null)}
+        okText="重置"
+        confirmLoading={resetPasswordMutation.isPending}
+        onOk={() => passwordForm.validateFields().then((values) => resetPasswordMutation.mutate({ id: resettingUser.id, password: values.password }))}
+      >
+        <Form form={passwordForm} layout="vertical">
+          <Form.Item name="password" label="新密码" rules={[{ required: true, min: 8 }]}>
+            <Input.Password />
+          </Form.Item>
+        </Form>
+      </Modal>
     </section>
   );
 }
@@ -506,8 +828,8 @@ function ApiKeyWorkspace({ api }) {
         <Button type="primary" htmlType="submit" loading={createKey.isPending}>创建 API Key</Button>
       </Form>
       <Descriptions className="api-doc" bordered column={1} items={[
-        { key: "chat", label: "OpenAI 兼容", children: "POST /api/v1/chat/completions，Header: Authorization: Bearer rag-..." },
-        { key: "retrieval", label: "检索接口", children: "POST /api/v1/knowledge/{knowledge_base_id}/retrieval" },
+        { key: "chat", label: "OpenAI 兼容", children: "POST /v1/chat/completions，Header: Authorization: Bearer rag-..." },
+        { key: "retrieval", label: "检索接口", children: "POST /v1/knowledge/{knowledge_base_id}/retrieval" },
       ]} />
       <Table
         rowKey="id"

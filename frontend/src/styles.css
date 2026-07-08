@@ -134,6 +134,11 @@ body {
   margin-bottom: 14px;
 }
 
+.stats-row,
+.table-tools {
+  margin-bottom: 14px;
+}
+
 .upload-zone .anticon {
   color: #2563eb;
   font-size: 28px;
@@ -204,6 +209,12 @@ body {
   border-radius: 8px;
   color: #66758a;
   background: #f8fafc;
+}
+
+.empty-text.compact {
+  min-height: 54px;
+  margin-bottom: 14px;
+  padding: 0 14px;
 }
 
 .login-screen {

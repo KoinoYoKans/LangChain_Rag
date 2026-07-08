@@ -9,12 +9,15 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from config.database import (
+    ApiKeyModel,
     AuditLogModel,
     ChatLogModel,
     DepartmentModel,
+    IngestJobModel,
     KnowledgeBaseMemberModel,
     KnowledgeBaseModel,
     OrganizationModel,
+    RagFileModel,
     UserModel,
     build_async_session_maker,
 )
@@ -64,8 +67,28 @@ class KnowledgeBase:
     description: str | None
     visibility: str
     department_ids: list[str]
+    status: str
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class KnowledgeBaseStats:
+    file_count: int
+    completed_file_count: int
+    failed_job_count: int
+
+
+@dataclass(frozen=True)
+class KnowledgeBaseMember:
+    id: str
+    knowledge_base_id: str
+    user_id: str
+    role: str
+    email: str | None
+    display_name: str | None
+    department_id: str | None
+    created_at: datetime
 
 
 async def bootstrap_default_org(settings: AppSettings) -> EnterpriseUser:
@@ -170,6 +193,67 @@ async def create_user(
         return _user_to_dataclass(user)
 
 
+async def update_user(
+    settings: AppSettings,
+    *,
+    org_id: str,
+    user_id: str,
+    display_name: str,
+    role: str,
+    department_id: str | None,
+    is_active: bool,
+) -> EnterpriseUser:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            user = await session.get(UserModel, UUID(user_id))
+            if user is None or user.org_id != UUID(org_id):
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="User not found")
+            user.display_name = display_name
+            user.role = role
+            user.department_id = UUID(department_id) if department_id else None
+            user.is_active = is_active
+        await session.refresh(user)
+        return _user_to_dataclass(user)
+
+
+async def reset_user_password(settings: AppSettings, *, org_id: str, user_id: str, password: str) -> EnterpriseUser:
+    from core.auth import hash_password
+
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            user = await session.get(UserModel, UUID(user_id))
+            if user is None or user.org_id != UUID(org_id):
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="User not found")
+            user.password_hash = hash_password(password)
+        await session.refresh(user)
+        return _user_to_dataclass(user)
+
+
+async def deactivate_user(settings: AppSettings, *, org_id: str, user_id: str) -> EnterpriseUser:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            user = await session.get(UserModel, UUID(user_id))
+            if user is None or user.org_id != UUID(org_id):
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="User not found")
+            user.is_active = False
+            await session.execute(
+                update(ApiKeyModel)
+                .where(ApiKeyModel.user_id == user.id)
+                .values(is_active=False)
+            )
+        await session.refresh(user)
+        return _user_to_dataclass(user)
+
+
 async def list_departments(settings: AppSettings, org_id: str) -> list[Department]:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
@@ -199,7 +283,10 @@ async def list_knowledge_bases(settings: AppSettings, user: Any) -> list[Knowled
     async with session_maker() as session:
         result = await session.scalars(
             select(KnowledgeBaseModel)
-            .where(KnowledgeBaseModel.org_id == UUID(user.org_id))
+            .where(
+                KnowledgeBaseModel.org_id == UUID(user.org_id),
+                KnowledgeBaseModel.status != "deleted",
+            )
             .order_by(KnowledgeBaseModel.updated_at.desc())
         )
         return [
@@ -226,6 +313,7 @@ async def create_knowledge_base(
         description=description,
         visibility=visibility,
         department_ids=department_ids,
+        status="active",
     )
     member = KnowledgeBaseMemberModel(id=uuid4(), knowledge_base_id=kb.id, user_id=UUID(user.id), role="owner")
     session_maker = build_async_session_maker(settings)
@@ -244,11 +332,188 @@ async def get_knowledge_base(settings: AppSettings, kb_id: str) -> KnowledgeBase
         return _kb_to_dataclass(kb) if kb else None
 
 
+async def update_knowledge_base(
+    settings: AppSettings,
+    *,
+    kb_id: str,
+    user: Any,
+    name: str,
+    description: str | None,
+    visibility: str,
+    department_ids: list[str],
+) -> KnowledgeBase:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            kb = await session.get(KnowledgeBaseModel, UUID(kb_id))
+            if kb is None or kb.org_id != UUID(user.org_id) or kb.status == "deleted":
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="Knowledge base not found")
+            if not await _can_access_kb_model(session, kb, user, write=True):
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=403, detail="Knowledge base access denied")
+            kb.name = name
+            kb.description = description
+            kb.visibility = visibility
+            kb.department_ids = department_ids
+        await session.refresh(kb)
+        return _kb_to_dataclass(kb)
+
+
+async def soft_delete_knowledge_base(settings: AppSettings, *, kb_id: str, user: Any) -> KnowledgeBase:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            kb = await session.get(KnowledgeBaseModel, UUID(kb_id))
+            if kb is None or kb.org_id != UUID(user.org_id) or kb.status == "deleted":
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="Knowledge base not found")
+            if not await _can_access_kb_model(session, kb, user, write=True):
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=403, detail="Knowledge base access denied")
+            kb.status = "deleted"
+            kb.deleted_at = datetime.utcnow()
+            await session.execute(
+                update(RagFileModel)
+                .where(RagFileModel.knowledge_base_id == kb.id, RagFileModel.status != "deleted")
+                .values(status="deleted", deleted_at=func.now())
+            )
+            await session.execute(
+                update(ApiKeyModel)
+                .where(ApiKeyModel.knowledge_base_id == kb.id)
+                .values(is_active=False)
+            )
+        await session.refresh(kb)
+        return _kb_to_dataclass(kb)
+
+
+async def get_knowledge_base_stats(settings: AppSettings, knowledge_base_id: str) -> KnowledgeBaseStats:
+    kb_uuid = UUID(knowledge_base_id)
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        file_count = await session.scalar(
+            select(func.count())
+            .select_from(RagFileModel)
+            .where(RagFileModel.knowledge_base_id == kb_uuid, RagFileModel.status != "deleted")
+        )
+        completed_file_count = await session.scalar(
+            select(func.count())
+            .select_from(RagFileModel)
+            .where(RagFileModel.knowledge_base_id == kb_uuid, RagFileModel.status == "completed")
+        )
+        failed_job_count = await session.scalar(
+            select(func.count())
+            .select_from(IngestJobModel)
+            .where(IngestJobModel.knowledge_base_id == kb_uuid, IngestJobModel.status == "failed")
+        )
+        return KnowledgeBaseStats(
+            file_count=int(file_count or 0),
+            completed_file_count=int(completed_file_count or 0),
+            failed_job_count=int(failed_job_count or 0),
+        )
+
+
+async def list_knowledge_base_members(settings: AppSettings, kb_id: str) -> list[KnowledgeBaseMember]:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        rows = await session.execute(
+            select(KnowledgeBaseMemberModel, UserModel)
+            .join(UserModel, KnowledgeBaseMemberModel.user_id == UserModel.id)
+            .where(KnowledgeBaseMemberModel.knowledge_base_id == UUID(kb_id))
+            .order_by(KnowledgeBaseMemberModel.created_at.asc())
+        )
+        return [_member_to_dataclass(member, user) for member, user in rows]
+
+
+async def is_knowledge_base_owner(settings: AppSettings, *, kb_id: str, user_id: str) -> bool:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        kb = await session.get(KnowledgeBaseModel, UUID(kb_id))
+        if kb is None:
+            return False
+        if str(kb.owner_user_id) == user_id:
+            return True
+        member = await session.scalar(
+            select(KnowledgeBaseMemberModel).where(
+                KnowledgeBaseMemberModel.knowledge_base_id == UUID(kb_id),
+                KnowledgeBaseMemberModel.user_id == UUID(user_id),
+                KnowledgeBaseMemberModel.role == "owner",
+            )
+        )
+        return member is not None
+
+
+async def upsert_knowledge_base_member(
+    settings: AppSettings,
+    *,
+    kb_id: str,
+    user_id: str,
+    role: str,
+) -> KnowledgeBaseMember:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        kb = await session.get(KnowledgeBaseModel, UUID(kb_id))
+        user = await session.get(UserModel, UUID(user_id))
+        if kb is None or user is None or user.org_id != kb.org_id or not user.is_active:
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=404, detail="Knowledge base member user not found")
+    stmt = insert(KnowledgeBaseMemberModel).values(
+        id=uuid4(),
+        knowledge_base_id=UUID(kb_id),
+        user_id=UUID(user_id),
+        role=role,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[
+            KnowledgeBaseMemberModel.knowledge_base_id,
+            KnowledgeBaseMemberModel.user_id,
+        ],
+        set_={"role": stmt.excluded.role},
+    )
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(stmt)
+        row = await session.execute(
+            select(KnowledgeBaseMemberModel, UserModel)
+            .join(UserModel, KnowledgeBaseMemberModel.user_id == UserModel.id)
+            .where(
+                KnowledgeBaseMemberModel.knowledge_base_id == UUID(kb_id),
+                KnowledgeBaseMemberModel.user_id == UUID(user_id),
+            )
+        )
+        member, user = row.one()
+        return _member_to_dataclass(member, user)
+
+
+async def remove_knowledge_base_member(settings: AppSettings, *, kb_id: str, user_id: str) -> None:
+    from sqlalchemy import delete
+
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            kb = await session.get(KnowledgeBaseModel, UUID(kb_id))
+            if kb is not None and str(kb.owner_user_id) == user_id:
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=400, detail="Knowledge base owner cannot be removed")
+            await session.execute(
+                delete(KnowledgeBaseMemberModel).where(
+                    KnowledgeBaseMemberModel.knowledge_base_id == UUID(kb_id),
+                    KnowledgeBaseMemberModel.user_id == UUID(user_id),
+                )
+            )
+
+
 async def require_knowledge_base_access(settings: AppSettings, kb_id: str, user: Any, write: bool = False) -> KnowledgeBase:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
         kb = await session.get(KnowledgeBaseModel, UUID(kb_id))
-        if kb is None or kb.org_id != UUID(user.org_id):
+        if kb is None or kb.org_id != UUID(user.org_id) or kb.status == "deleted":
             from fastapi import HTTPException
 
             raise HTTPException(status_code=404, detail="Knowledge base not found")
@@ -360,15 +625,6 @@ async def add_chat_log(
 async def _can_access_kb_model(session: Any, kb: KnowledgeBaseModel, user: Any, write: bool) -> bool:
     if user.role == "admin":
         return True
-    if write and user.role not in WRITE_ROLES:
-        member = await session.scalar(
-            select(KnowledgeBaseMemberModel).where(
-                KnowledgeBaseMemberModel.knowledge_base_id == kb.id,
-                KnowledgeBaseMemberModel.user_id == UUID(user.id),
-                KnowledgeBaseMemberModel.role.in_(("owner", "editor")),
-            )
-        )
-        return member is not None
     if str(kb.owner_user_id) == user.id:
         return True
     member = await session.scalar(
@@ -377,13 +633,17 @@ async def _can_access_kb_model(session: Any, kb: KnowledgeBaseModel, user: Any, 
             KnowledgeBaseMemberModel.user_id == UUID(user.id),
         )
     )
-    if member is not None:
-        return True
-    if kb.visibility == "org":
-        return True
-    if kb.visibility == "department" and user.department_id and user.department_id in list(kb.department_ids or []):
-        return True
-    return False
+    if member is None:
+        if write:
+            return False
+        if kb.visibility == "org":
+            return True
+        if kb.visibility == "department" and user.department_id and user.department_id in list(kb.department_ids or []):
+            return True
+        return False
+    if write:
+        return member.role in {"owner", "editor"}
+    return member.role in {"owner", "editor", "viewer"}
 
 
 def _user_to_dataclass(model: UserModel) -> EnterpriseUser:
@@ -420,6 +680,20 @@ def _kb_to_dataclass(model: KnowledgeBaseModel) -> KnowledgeBase:
         description=model.description,
         visibility=model.visibility,
         department_ids=list(model.department_ids or []),
+        status=model.status,
         created_at=model.created_at,
         updated_at=model.updated_at,
+    )
+
+
+def _member_to_dataclass(member: KnowledgeBaseMemberModel, user: UserModel) -> KnowledgeBaseMember:
+    return KnowledgeBaseMember(
+        id=str(member.id),
+        knowledge_base_id=str(member.knowledge_base_id),
+        user_id=str(member.user_id),
+        role=member.role,
+        email=user.email,
+        display_name=user.display_name,
+        department_id=str(user.department_id) if user.department_id else None,
+        created_at=member.created_at,
     )

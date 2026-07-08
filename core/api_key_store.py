@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import select, update
 
-from config.database import ApiKeyModel, build_async_session_maker
+from config.database import ApiKeyModel, KnowledgeBaseModel, UserModel, build_async_session_maker
 from config.settings import AppSettings
 
 
@@ -64,7 +64,7 @@ async def list_api_keys(settings: AppSettings, org_id: str) -> list[ApiKey]:
     async with session_maker() as session:
         result = await session.scalars(
             select(ApiKeyModel)
-            .where(ApiKeyModel.org_id == UUID(org_id))
+            .where(ApiKeyModel.org_id == UUID(org_id), ApiKeyModel.is_active.is_(True))
             .order_by(ApiKeyModel.created_at.desc())
         )
         return [_to_dataclass(item) for item in result]
@@ -75,7 +75,15 @@ async def verify_api_key(settings: AppSettings, secret: str) -> ApiKey | None:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
         model = await session.scalar(
-            select(ApiKeyModel).where(ApiKeyModel.key_prefix == prefix, ApiKeyModel.is_active.is_(True))
+            select(ApiKeyModel)
+            .join(KnowledgeBaseModel, ApiKeyModel.knowledge_base_id == KnowledgeBaseModel.id)
+            .join(UserModel, ApiKeyModel.user_id == UserModel.id)
+            .where(
+                ApiKeyModel.key_prefix == prefix,
+                ApiKeyModel.is_active.is_(True),
+                KnowledgeBaseModel.status != "deleted",
+                UserModel.is_active.is_(True),
+            )
         )
         if model is None or model.key_hash != _hash_key(secret):
             return None

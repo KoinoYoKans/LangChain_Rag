@@ -41,15 +41,27 @@ from core.enterprise_store import (
     create_department,
     create_knowledge_base,
     create_user,
+    deactivate_user,
+    get_user_by_id,
+    get_knowledge_base_stats,
+    is_knowledge_base_owner,
+    list_knowledge_base_members,
     list_audit_logs,
     list_departments,
     list_knowledge_bases,
     list_users,
+    remove_knowledge_base_member,
     require_knowledge_base_access,
+    reset_user_password,
+    soft_delete_knowledge_base,
+    update_knowledge_base,
+    update_user,
+    upsert_knowledge_base_member,
 )
 from core.file_store import (
     RagFile,
     create_processing_file,
+    count_completed_knowledge_base_files,
     delete_file_chunks,
     delete_file_chunks_by_file_id,
     delete_file_record,
@@ -64,8 +76,9 @@ from core.file_store import (
     save_file_chunks,
 )
 from core.ingest_store import IngestJob, create_ingest_job, get_ingest_job, list_ingest_jobs
+from core.ingest_store import retry_failed_ingest_job
 from core.job_queue import enqueue_ingest_job
-from core.rerank import Reranker, build_reranker
+from core.rerank import RerankedDocument, Reranker, build_reranker
 from core.retrieval import hybrid_search
 from core.vector_store import (
     add_documents,
@@ -198,6 +211,17 @@ class UserCreateRequest(BaseModel):
     department_id: str | None = None
 
 
+class UserUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=1)
+    role: str = Field(default="member", pattern="^(admin|manager|member)$")
+    department_id: str | None = None
+    is_active: bool = True
+
+
+class PasswordResetRequest(BaseModel):
+    password: str = Field(min_length=8)
+
+
 class UserResponse(BaseModel):
     id: str
     org_id: str
@@ -217,6 +241,13 @@ class KnowledgeBaseCreateRequest(BaseModel):
     department_ids: list[str] = Field(default_factory=list)
 
 
+class KnowledgeBaseUpdateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    description: str | None = None
+    visibility: str = Field(default="department", pattern="^(private|department|org)$")
+    department_ids: list[str] = Field(default_factory=list)
+
+
 class KnowledgeBaseResponse(BaseModel):
     id: str
     org_id: str
@@ -225,12 +256,36 @@ class KnowledgeBaseResponse(BaseModel):
     description: str | None
     visibility: str
     department_ids: list[str]
+    status: str = "active"
+    file_count: int = 0
+    completed_file_count: int = 0
+    failed_job_count: int = 0
     created_at: str
     updated_at: str
 
 
 class KnowledgeBaseListResponse(BaseModel):
     items: list[KnowledgeBaseResponse]
+
+
+class KnowledgeBaseMemberUpsertRequest(BaseModel):
+    user_id: str = Field(min_length=1)
+    role: str = Field(pattern="^(owner|editor|viewer)$")
+
+
+class KnowledgeBaseMemberResponse(BaseModel):
+    id: str
+    knowledge_base_id: str
+    user_id: str
+    role: str
+    email: str | None
+    display_name: str | None
+    department_id: str | None
+    created_at: str
+
+
+class KnowledgeBaseMemberListResponse(BaseModel):
+    items: list[KnowledgeBaseMemberResponse]
 
 
 class UrlIngestRequest(BaseModel):
@@ -252,6 +307,7 @@ class IngestJobResponse(BaseModel):
     retry_count: int
     payload: dict[str, Any]
     file_id: str | None
+    duration_ms: int | None = None
     created_at: str
     updated_at: str
 
@@ -486,6 +542,8 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> UserResponse:
         require_manager(current_user)
+        if request.role in {"admin", "manager"} and not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="Only admins can create admin or manager users")
         settings = get_state(app).settings
         user = await create_user(
             settings,
@@ -509,11 +567,112 @@ def create_app() -> FastAPI:
         )
         return user_response(user)
 
+    @app.patch("/users/{user_id}", response_model=UserResponse)
+    async def update_user_endpoint(
+        http_request: Request,
+        user_id: str,
+        request: UserUpdateRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> UserResponse:
+        require_manager(current_user)
+        if request.role in {"admin", "manager"} and not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="Only admins can grant admin or manager role")
+        existing_user = await get_user_by_id(get_state(app).settings, user_id)
+        if existing_user and existing_user.role in {"admin", "manager"} and not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="Only admins can manage admin or manager users")
+        if user_id == current_user.id and not request.is_active:
+            raise HTTPException(status_code=400, detail="You cannot deactivate yourself")
+        settings = get_state(app).settings
+        user = await update_user(
+            settings,
+            org_id=current_user.org_id,
+            user_id=user_id,
+            display_name=request.display_name,
+            role=request.role,
+            department_id=request.department_id,
+            is_active=request.is_active,
+        )
+        await add_audit_log(
+            settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="user.update",
+            target_type="user",
+            target_id=user.id,
+            metadata={
+                "role": user.role,
+                "department_id": user.department_id,
+                "is_active": user.is_active,
+            },
+            **audit_context(http_request),
+        )
+        return user_response(user)
+
+    @app.post("/users/{user_id}/reset-password", response_model=UserResponse)
+    async def reset_user_password_endpoint(
+        http_request: Request,
+        user_id: str,
+        request: PasswordResetRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> UserResponse:
+        require_manager(current_user)
+        existing_user = await get_user_by_id(get_state(app).settings, user_id)
+        if existing_user and existing_user.role in {"admin", "manager"} and not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="Only admins can manage admin or manager users")
+        settings = get_state(app).settings
+        user = await reset_user_password(
+            settings,
+            org_id=current_user.org_id,
+            user_id=user_id,
+            password=request.password,
+        )
+        await add_audit_log(
+            settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="user.reset_password",
+            target_type="user",
+            target_id=user.id,
+            **audit_context(http_request),
+        )
+        return user_response(user)
+
+    @app.delete("/users/{user_id}", response_model=UserResponse)
+    async def deactivate_user_endpoint(
+        http_request: Request,
+        user_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> UserResponse:
+        require_manager(current_user)
+        if user_id == current_user.id:
+            raise HTTPException(status_code=400, detail="You cannot deactivate yourself")
+        existing_user = await get_user_by_id(get_state(app).settings, user_id)
+        if existing_user and existing_user.role in {"admin", "manager"} and not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="Only admins can manage admin or manager users")
+        settings = get_state(app).settings
+        user = await deactivate_user(settings, org_id=current_user.org_id, user_id=user_id)
+        await add_audit_log(
+            settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="user.deactivate",
+            target_type="user",
+            target_id=user.id,
+            **audit_context(http_request),
+        )
+        return user_response(user)
+
     @app.get("/knowledge-bases", response_model=KnowledgeBaseListResponse)
     async def knowledge_bases(current_user: CurrentUser = Depends(require_current_user)) -> KnowledgeBaseListResponse:
         settings = get_state(app).settings
         return KnowledgeBaseListResponse(
-            items=[kb_response(item) for item in await list_knowledge_bases(settings, current_user)]
+            items=[
+                kb_response(item, await get_knowledge_base_stats(settings, item.id))
+                for item in await list_knowledge_bases(settings, current_user)
+            ]
         )
 
     @app.post("/knowledge-bases", response_model=KnowledgeBaseResponse)
@@ -543,7 +702,142 @@ def create_app() -> FastAPI:
             metadata={"name": kb.name, "visibility": kb.visibility, "department_ids": kb.department_ids},
             **audit_context(http_request),
         )
-        return kb_response(kb)
+        return kb_response(kb, await get_knowledge_base_stats(settings, kb.id))
+
+    @app.patch("/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseResponse)
+    async def update_knowledge_base_endpoint(
+        http_request: Request,
+        knowledge_base_id: str,
+        request: KnowledgeBaseUpdateRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> KnowledgeBaseResponse:
+        require_manager(current_user)
+        settings = get_state(app).settings
+        kb = await update_knowledge_base(
+            settings,
+            kb_id=knowledge_base_id,
+            user=current_user,
+            name=request.name,
+            description=request.description,
+            visibility=request.visibility,
+            department_ids=request.department_ids or ([current_user.department_id] if current_user.department_id else []),
+        )
+        await add_audit_log(
+            settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="knowledge_base.update",
+            target_type="knowledge_base",
+            target_id=kb.id,
+            metadata={"name": kb.name, "visibility": kb.visibility, "department_ids": kb.department_ids},
+            **audit_context(http_request),
+        )
+        return kb_response(kb, await get_knowledge_base_stats(settings, kb.id))
+
+    @app.delete("/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseResponse)
+    async def delete_knowledge_base_endpoint(
+        http_request: Request,
+        knowledge_base_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> KnowledgeBaseResponse:
+        require_manager(current_user)
+        settings = get_state(app).settings
+        kb = await soft_delete_knowledge_base(settings, kb_id=knowledge_base_id, user=current_user)
+        await add_audit_log(
+            settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="knowledge_base.delete",
+            target_type="knowledge_base",
+            target_id=kb.id,
+            metadata={"name": kb.name},
+            **audit_context(http_request),
+        )
+        return kb_response(kb, await get_knowledge_base_stats(settings, kb.id))
+
+    @app.get("/knowledge-bases/{knowledge_base_id}/stats")
+    async def knowledge_base_stats_endpoint(
+        knowledge_base_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, int]:
+        settings = get_state(app).settings
+        await require_knowledge_base_access(settings, knowledge_base_id, current_user)
+        stats = await get_knowledge_base_stats(settings, knowledge_base_id)
+        return {
+            "file_count": stats.file_count,
+            "completed_file_count": stats.completed_file_count,
+            "failed_job_count": stats.failed_job_count,
+        }
+
+    @app.get("/knowledge-bases/{knowledge_base_id}/members", response_model=KnowledgeBaseMemberListResponse)
+    async def knowledge_base_members_endpoint(
+        knowledge_base_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> KnowledgeBaseMemberListResponse:
+        settings = get_state(app).settings
+        await require_knowledge_base_access(settings, knowledge_base_id, current_user)
+        await require_kb_member_admin(settings, knowledge_base_id, current_user)
+        return KnowledgeBaseMemberListResponse(
+            items=[
+                kb_member_response(item)
+                for item in await list_knowledge_base_members(settings, knowledge_base_id)
+            ]
+        )
+
+    @app.put("/knowledge-bases/{knowledge_base_id}/members", response_model=KnowledgeBaseMemberResponse)
+    async def upsert_knowledge_base_member_endpoint(
+        http_request: Request,
+        knowledge_base_id: str,
+        request: KnowledgeBaseMemberUpsertRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> KnowledgeBaseMemberResponse:
+        settings = get_state(app).settings
+        await require_knowledge_base_access(settings, knowledge_base_id, current_user, write=True)
+        await require_kb_member_admin(settings, knowledge_base_id, current_user)
+        member = await upsert_knowledge_base_member(
+            settings,
+            kb_id=knowledge_base_id,
+            user_id=request.user_id,
+            role=request.role,
+        )
+        await add_audit_log(
+            settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="knowledge_base.member_upsert",
+            target_type="knowledge_base",
+            target_id=knowledge_base_id,
+            metadata={"user_id": request.user_id, "role": request.role},
+            **audit_context(http_request),
+        )
+        return kb_member_response(member)
+
+    @app.delete("/knowledge-bases/{knowledge_base_id}/members/{member_user_id}")
+    async def delete_knowledge_base_member_endpoint(
+        http_request: Request,
+        knowledge_base_id: str,
+        member_user_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, str]:
+        settings = get_state(app).settings
+        await require_knowledge_base_access(settings, knowledge_base_id, current_user, write=True)
+        await require_kb_member_admin(settings, knowledge_base_id, current_user)
+        await remove_knowledge_base_member(settings, kb_id=knowledge_base_id, user_id=member_user_id)
+        await add_audit_log(
+            settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="knowledge_base.member_remove",
+            target_type="knowledge_base",
+            target_id=knowledge_base_id,
+            metadata={"user_id": member_user_id},
+            **audit_context(http_request),
+        )
+        return {"status": "ok"}
 
     @app.get("/audit-logs", response_model=AuditLogListResponse)
     async def audit_logs(
@@ -762,6 +1056,7 @@ def create_app() -> FastAPI:
     async def knowledge_base_ingest_jobs(
         knowledge_base_id: str,
         limit: int = Query(default=100, ge=1, le=500),
+        status: str = Query(default="all", pattern="^(active|history|all|pending|running|succeeded|failed|cancelled)$"),
         current_user: CurrentUser = Depends(require_current_user),
     ) -> IngestJobListResponse:
         state = get_state(app)
@@ -769,7 +1064,7 @@ def create_app() -> FastAPI:
         return IngestJobListResponse(
             items=[
                 ingest_job_response(item)
-                for item in await list_ingest_jobs(state.settings, knowledge_base_id, limit=limit)
+                for item in await list_ingest_jobs(state.settings, knowledge_base_id, limit=limit, status=status)
             ]
         )
 
@@ -785,11 +1080,42 @@ def create_app() -> FastAPI:
         await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user)
         return ingest_job_response(job)
 
+    @app.post("/ingest-jobs/{job_id}/retry", response_model=IngestJobResponse)
+    async def retry_ingest_job_endpoint(
+        http_request: Request,
+        job_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> IngestJobResponse:
+        state = get_state(app)
+        job = await get_ingest_job(state.settings, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Ingest job not found")
+        await require_knowledge_base_access(state.settings, job.knowledge_base_id, current_user, write=True)
+        try:
+            retried = await retry_failed_ingest_job(state.settings, job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        enqueue_ingest_job(state.settings, job_id)
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="ingest.retry_requested",
+            target_type="ingest_job",
+            target_id=job_id,
+            metadata={"knowledge_base_id": job.knowledge_base_id, "retry_count": retried.retry_count},
+            **audit_context(http_request),
+        )
+        return ingest_job_response(retried)
+
     @app.get("/knowledge-bases/{knowledge_base_id}/documents", response_model=FileListResponse)
     async def knowledge_base_documents(
         knowledge_base_id: str,
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
+        status: str | None = Query(default=None, pattern="^(processing|completed|failed|deleted)$"),
+        include_deleted: bool = Query(default=False),
         current_user: CurrentUser = Depends(require_current_user),
     ) -> FileListResponse:
         state = get_state(app)
@@ -797,7 +1123,14 @@ def create_app() -> FastAPI:
         return FileListResponse(
             items=[
                 file_record_response(item)
-                for item in await list_knowledge_base_files(state.settings, knowledge_base_id, limit=limit, offset=offset)
+                for item in await list_knowledge_base_files(
+                    state.settings,
+                    knowledge_base_id,
+                    limit=limit,
+                    offset=offset,
+                    status=status,
+                    include_deleted=include_deleted,
+                )
             ]
         )
 
@@ -977,6 +1310,11 @@ def create_app() -> FastAPI:
     ) -> ChatResponse:
         state = require_ready(app)
         await require_knowledge_base_access(state.settings, request.knowledge_base_id, current_user)
+        if await count_completed_knowledge_base_files(state.settings, request.knowledge_base_id) <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "该知识库还没有完成入库的文档，请先上传并等待处理完成。", "stage": "documents"},
+            )
         top_k = request.top_k or state.settings.rag_top_k
         rerank_top_n = request.rerank_top_n if request.rerank_top_n is not None else state.settings.rerank_top_n
         conversation_id = request.conversation_id or str(uuid4())
@@ -1015,17 +1353,23 @@ def create_app() -> FastAPI:
                 knowledge_base_id=request.knowledge_base_id,
                 top_k=top_k,
             )
-            ranked_documents = state.reranker.rerank(retrieval_query, retrieval.documents, rerank_top_n)
+            if not retrieval.documents:
+                ranked_documents = []
+            else:
+                ranked_documents = rerank_or_original(state.reranker, retrieval_query, retrieval.documents, rerank_top_n)
             selected = ranked_documents[: rerank_top_n or len(ranked_documents)]
-            context = format_context([item.document for item in selected])
-            prompt = build_prompt().invoke(
-                {
-                    "question": request.message,
-                    "context": context,
-                    "history": format_history(history),
-                }
-            )
-            answer = state.chat_model.invoke(prompt).content
+            if selected:
+                context = format_context([item.document for item in selected])
+                prompt = build_prompt().invoke(
+                    {
+                        "question": request.message,
+                        "context": context,
+                        "history": format_history(history),
+                    }
+                )
+                answer = state.chat_model.invoke(prompt).content
+            else:
+                answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
             sources = [
                 source_from_document(item.document, rerank_score=item.score)
                 for item in selected
@@ -1069,8 +1413,23 @@ def create_app() -> FastAPI:
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
                 **audit_context(http_request),
             )
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=f"Chat failed: {exc}") from exc
+            await add_audit_log(
+                state.settings,
+                org_id=current_user.org_id,
+                actor_user_id=current_user.id,
+                actor_department_id=current_user.department_id,
+                action="chat.ask",
+                target_type="knowledge_base",
+                target_id=request.knowledge_base_id,
+                result="failed",
+                error_message=str(exc)[:1000],
+                metadata={"conversation_id": conversation_id, "query": request.message},
+                **audit_context(http_request),
+            )
+            raise HTTPException(status_code=500, detail={"message": f"问答失败：{exc}", "stage": "chat"}) from exc
 
         return ChatResponse(
             conversation_id=conversation_id,
@@ -1099,7 +1458,12 @@ def create_app() -> FastAPI:
             user_id=api_key.user_id,
             knowledge_base_id=knowledge_base_id,
         )
-        ranked = state.reranker.rerank(request.query, retrieval.documents, min(request.top_k, state.settings.rerank_top_n or request.top_k))
+        ranked = rerank_or_original(
+            state.reranker,
+            request.query,
+            retrieval.documents,
+            min(request.top_k, state.settings.rerank_top_n or request.top_k),
+        )
         return RetrievalResponse(items=[source_from_document(item.document, item.score) for item in ranked])
 
     @app.post("/v1/chat/completions")
@@ -1127,16 +1491,19 @@ def create_app() -> FastAPI:
             user_id=api_key.user_id,
             knowledge_base_id=api_key.knowledge_base_id,
         )
-        ranked_documents = state.reranker.rerank(retrieval_query, retrieval.documents, state.settings.rerank_top_n)
+        ranked_documents = rerank_or_original(state.reranker, retrieval_query, retrieval.documents, state.settings.rerank_top_n)
         selected = ranked_documents[: state.settings.rerank_top_n or len(ranked_documents)]
-        prompt = build_prompt().invoke(
-            {
-                "question": question,
-                "context": format_context([item.document for item in selected]),
-                "history": "\n".join(f"{item.role}: {item.content}" for item in request.messages[:-1]) or "No prior messages.",
-            }
-        )
-        answer = str(state.chat_model.invoke(prompt).content)
+        if selected:
+            prompt = build_prompt().invoke(
+                {
+                    "question": question,
+                    "context": format_context([item.document for item in selected]),
+                    "history": "\n".join(f"{item.role}: {item.content}" for item in request.messages[:-1]) or "No prior messages.",
+                }
+            )
+            answer = str(state.chat_model.invoke(prompt).content)
+        else:
+            answer = "没有在当前知识库中检索到相关内容。请确认文档已经完成入库，或换一种问法。"
         sources = [source_from_document(item.document, item.score).model_dump() for item in selected]
         conversation_id = request.conversation_id or str(uuid4())
         latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -1379,7 +1746,7 @@ def department_response(department: Any) -> DepartmentResponse:
     )
 
 
-def kb_response(kb: Any) -> KnowledgeBaseResponse:
+def kb_response(kb: Any, stats: Any | None = None) -> KnowledgeBaseResponse:
     return KnowledgeBaseResponse(
         id=kb.id,
         org_id=kb.org_id,
@@ -1388,8 +1755,25 @@ def kb_response(kb: Any) -> KnowledgeBaseResponse:
         description=kb.description,
         visibility=kb.visibility,
         department_ids=kb.department_ids,
+        status=getattr(kb, "status", "active"),
+        file_count=int(getattr(stats, "file_count", 0) if stats else 0),
+        completed_file_count=int(getattr(stats, "completed_file_count", 0) if stats else 0),
+        failed_job_count=int(getattr(stats, "failed_job_count", 0) if stats else 0),
         created_at=kb.created_at.isoformat(),
         updated_at=kb.updated_at.isoformat(),
+    )
+
+
+def kb_member_response(member: Any) -> KnowledgeBaseMemberResponse:
+    return KnowledgeBaseMemberResponse(
+        id=member.id,
+        knowledge_base_id=member.knowledge_base_id,
+        user_id=member.user_id,
+        role=member.role,
+        email=member.email,
+        display_name=member.display_name,
+        department_id=member.department_id,
+        created_at=member.created_at.isoformat(),
     )
 
 
@@ -1408,6 +1792,7 @@ def ingest_job_response(job: IngestJob) -> IngestJobResponse:
         retry_count=job.retry_count,
         payload=job.payload,
         file_id=job.file_id,
+        duration_ms=job.duration_ms,
         created_at=job.created_at.isoformat(),
         updated_at=job.updated_at.isoformat(),
     )
@@ -1445,6 +1830,12 @@ async def require_valid_api_key(
     return api_key
 
 
+async def require_kb_member_admin(settings: AppSettings, kb_id: str, user: CurrentUser) -> None:
+    if user.is_manager or await is_knowledge_base_owner(settings, kb_id=kb_id, user_id=user.id):
+        return
+    raise HTTPException(status_code=403, detail="Knowledge base owner or manager role required")
+
+
 def safe_upload_path(upload_storage_dir: str, source_uri: str) -> Path | None:
     if not source_uri:
         return None
@@ -1455,6 +1846,22 @@ def safe_upload_path(upload_storage_dir: str, source_uri: str) -> Path | None:
     except ValueError:
         return None
     return path
+
+
+def rerank_or_original(
+    reranker: Reranker,
+    query: str,
+    documents: list[Document],
+    top_n: int,
+) -> list[RerankedDocument]:
+    if not documents:
+        return []
+    if top_n <= 0:
+        return [RerankedDocument(document=document, score=None) for document in documents]
+    try:
+        return reranker.rerank(query, documents, top_n)
+    except Exception:  # noqa: BLE001
+        return [RerankedDocument(document=document, score=None) for document in documents[:top_n]]
 
 
 def rewrite_query(chat_model: Any, question: str, history: list[Any]) -> str:
