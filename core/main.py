@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
@@ -38,6 +40,7 @@ from core.document_loader import (
     hash_text,
 )
 from core.document_store import delete_document_artifacts, list_document_chunks, list_document_pages
+from core.document_parser import parse_html
 from core.embeddings import build_embeddings
 from core.enterprise_store import (
     add_audit_log,
@@ -90,8 +93,18 @@ from core.ingest_store import (
     get_ingest_job,
     get_ingest_queue_health,
     list_ingest_jobs,
+    mark_job_failed,
     retry_failed_ingest_job,
 )
+from core.import_plan_store import (
+    IMPORT_PLAN_TTL_SECONDS,
+    acquire_import_plan_lock,
+    load_import_plan,
+    refresh_import_plan,
+    release_import_plan_lock,
+    save_import_plan,
+)
+from core.ingestion import _extract_title, _fetch_url, _slugify
 from core.job_queue import enqueue_ingest_job, get_ingest_queue_length, get_worker_heartbeat
 from core.rerank import RerankedDocument, Reranker, build_reranker
 from core.retrieval import hybrid_search
@@ -365,6 +378,53 @@ class UrlIngestRequest(BaseModel):
     filename: str | None = None
 
 
+class UrlBatchPlanRequest(BaseModel):
+    urls: list[str] = Field(min_length=1, max_length=20)
+    skip_duplicates: bool = True
+
+
+class UrlBatchCommitRequest(BaseModel):
+    plan_id: str = Field(min_length=1)
+    client_item_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class UrlImportPlanItem(BaseModel):
+    index: int
+    client_item_id: str
+    source_type: str = "url"
+    url: str
+    filename: str | None = None
+    content_type: str | None = None
+    file_size: int | None = None
+    status: str
+    severity: str
+    can_enqueue: bool
+    reason_code: str | None = None
+    reason: str | None = None
+    content_sha256: str | None = None
+    content_length: int | None = None
+    estimated_chunks: int | None = None
+    duplicate_file_id: str | None = None
+    duplicate_of: str | None = None
+    job_id: str | None = None
+    confirmed_at: str | None = None
+
+
+class UrlImportPlanResponse(BaseModel):
+    plan_id: str
+    knowledge_base_id: str
+    created_at: str
+    expires_at: str
+    total: int
+    ready_count: int
+    warning_count: int
+    blocked_count: int
+    duplicate_count: int
+    invalid_count: int
+    error_count: int
+    items: list[UrlImportPlanItem]
+
+
 class IngestJobResponse(BaseModel):
     id: str
     org_id: str
@@ -421,6 +481,7 @@ class BatchItemResult(BaseModel):
 class BatchOperationResponse(BaseModel):
     succeeded: int
     failed: int
+    skipped: int = 0
     items: list[BatchItemResult]
 
 
@@ -1162,6 +1223,126 @@ def create_app() -> FastAPI:
             **audit_context(http_request),
         )
         return ingest_job_response(job)
+
+    @app.post("/knowledge-bases/{knowledge_base_id}/urls/plan", response_model=UrlImportPlanResponse)
+    async def plan_knowledge_base_urls(
+        http_request: Request,
+        knowledge_base_id: str,
+        request: UrlBatchPlanRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> UrlImportPlanResponse:
+        state = get_state(app)
+        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        plan = await build_url_import_plan(
+            state.settings,
+            org_id=current_user.org_id,
+            knowledge_base_id=knowledge_base_id,
+            user_id=current_user.id,
+            urls=request.urls,
+            skip_duplicates=request.skip_duplicates,
+        )
+        save_import_plan(state.settings, plan.plan_id, plan_cache_payload(plan, current_user))
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="batch_import.dry_run",
+            target_type="knowledge_base",
+            target_id=knowledge_base_id,
+            metadata={"plan_id": plan.plan_id, "total": plan.total, "ready": plan.ready_count, "blocked": plan.blocked_count},
+            **audit_context(http_request),
+        )
+        return plan
+
+    @app.post("/knowledge-bases/{knowledge_base_id}/urls/batch", response_model=BatchOperationResponse)
+    async def batch_ingest_knowledge_base_urls(
+        http_request: Request,
+        knowledge_base_id: str,
+        request: UrlBatchCommitRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> BatchOperationResponse:
+        state = get_state(app)
+        await require_knowledge_base_access(state.settings, knowledge_base_id, current_user, write=True)
+        lock_token = str(uuid4())
+        if not acquire_import_plan_lock(state.settings, request.plan_id, lock_token):
+            raise HTTPException(status_code=409, detail="Import plan is being confirmed")
+        try:
+            payload = load_import_plan(state.settings, request.plan_id)
+            if payload is None:
+                raise HTTPException(status_code=404, detail="Import plan not found or expired")
+            if (
+                payload.get("knowledge_base_id") != knowledge_base_id
+                or payload.get("user_id") != current_user.id
+                or payload.get("org_id") != current_user.org_id
+            ):
+                raise HTTPException(status_code=403, detail="Import plan does not belong to this user and knowledge base")
+            expires_at = parse_datetime(str(payload.get("expires_at") or ""))
+            if expires_at and expires_at < datetime.now(timezone.utc):
+                raise HTTPException(status_code=410, detail="Import plan has expired")
+            selected = set(request.client_item_ids)
+            items = [UrlImportPlanItem(**item) for item in payload.get("items", [])]
+            item_by_id = {item.client_item_id: item for item in items}
+            results: list[BatchItemResult] = []
+            for client_item_id in request.client_item_ids:
+                item = item_by_id.get(client_item_id)
+                if item is None:
+                    results.append(BatchItemResult(id=client_item_id, status="failed", message="Import plan item not found"))
+                    continue
+                if item.job_id:
+                    results.append(BatchItemResult(id=client_item_id, status="succeeded", job_id=item.job_id, message="Already enqueued"))
+                    continue
+                if not item.can_enqueue:
+                    results.append(BatchItemResult(id=client_item_id, status="skipped", message=item.reason or item.status))
+                    continue
+                try:
+                    job = await create_ingest_job(
+                        state.settings,
+                        org_id=current_user.org_id,
+                        knowledge_base_id=knowledge_base_id,
+                        created_by_user_id=current_user.id,
+                        source_type="url",
+                        source_uri=item.url,
+                        filename=item.filename,
+                        payload={
+                            "url": item.url,
+                            "planned_content_sha256": item.content_sha256,
+                            "estimated_chunks": item.estimated_chunks,
+                        },
+                    )
+                    try:
+                        enqueue_ingest_job(state.settings, job.id)
+                    except Exception as exc:  # noqa: BLE001
+                        await mark_job_failed(state.settings, job.id, f"Queue enqueue failed: {exc}")
+                        raise
+                    item.job_id = job.id
+                    item.confirmed_at = datetime.now(timezone.utc).isoformat()
+                    item_by_id[client_item_id] = item
+                    results.append(BatchItemResult(id=client_item_id, status="succeeded", job_id=job.id))
+                except Exception as exc:  # noqa: BLE001
+                    results.append(BatchItemResult(id=client_item_id, status="failed", message=str(exc)))
+            payload["items"] = [item_by_id.get(item.client_item_id, item).model_dump() for item in items]
+            refresh_import_plan(state.settings, request.plan_id, payload)
+        finally:
+            release_import_plan_lock(state.settings, request.plan_id, lock_token)
+        await add_audit_log(
+            state.settings,
+            org_id=current_user.org_id,
+            actor_user_id=current_user.id,
+            actor_department_id=current_user.department_id,
+            action="batch_import.confirmed",
+            target_type="ingest_job",
+            metadata={
+                "knowledge_base_id": knowledge_base_id,
+                "plan_id": request.plan_id,
+                "selected": len(selected),
+                "succeeded": sum(1 for item in results if item.status == "succeeded"),
+                "failed": sum(1 for item in results if item.status == "failed"),
+                "skipped": sum(1 for item in results if item.status == "skipped"),
+            },
+            **audit_context(http_request),
+        )
+        return batch_response(results)
 
     @app.get("/knowledge-bases/{knowledge_base_id}/ingest-jobs", response_model=IngestJobListResponse)
     async def knowledge_base_ingest_jobs(
@@ -2401,7 +2582,9 @@ def ingest_job_response(job: IngestJob) -> IngestJobResponse:
 
 def batch_response(items: list[BatchItemResult]) -> BatchOperationResponse:
     failed = sum(1 for item in items if item.status == "failed")
-    return BatchOperationResponse(succeeded=len(items) - failed, failed=failed, items=items)
+    skipped = sum(1 for item in items if item.status == "skipped")
+    succeeded = sum(1 for item in items if item.status == "succeeded")
+    return BatchOperationResponse(succeeded=succeeded, failed=failed, skipped=skipped, items=items)
 
 
 def queue_health_response(
@@ -2494,6 +2677,255 @@ def build_reindex_payload(settings: AppSettings, item: RagFile) -> tuple[dict[st
     if item.source_type == "url":
         return {"url": item.source_uri}, item.source_uri
     raise ValueError(f"Unsupported source type: {item.source_type}")
+
+
+def plan_cache_payload(plan: UrlImportPlanResponse, user: CurrentUser) -> dict[str, Any]:
+    return {
+        "plan_id": plan.plan_id,
+        "org_id": user.org_id,
+        "user_id": user.id,
+        "knowledge_base_id": plan.knowledge_base_id,
+        "created_at": plan.created_at,
+        "expires_at": plan.expires_at,
+        "items": [item.model_dump() for item in plan.items],
+    }
+
+
+async def build_url_import_plan(
+    settings: AppSettings,
+    *,
+    org_id: str,
+    knowledge_base_id: str,
+    user_id: str,
+    urls: list[str],
+    skip_duplicates: bool,
+) -> UrlImportPlanResponse:
+    now = datetime.now(timezone.utc)
+    plan_id = str(uuid4())
+    expires_at = now + timedelta(seconds=IMPORT_PLAN_TTL_SECONDS)
+    items: list[UrlImportPlanItem] = []
+    seen_urls: dict[str, UrlImportPlanItem] = {}
+    seen_hashes: dict[str, str] = {}
+    for index, raw_url in enumerate(urls):
+        url = raw_url.strip()
+        client_item_id = f"url-{index}"
+        if not url:
+            items.append(
+                UrlImportPlanItem(
+                    index=index,
+                    client_item_id=client_item_id,
+                    url=raw_url,
+                    status="invalid_url",
+                    severity="blocked",
+                    can_enqueue=False,
+                    reason_code="empty_url",
+                    reason="URL is empty",
+                )
+            )
+            continue
+        normalized_url = normalize_url(url)
+        if normalized_url in seen_urls:
+            first_item = seen_urls[normalized_url]
+            can_enqueue = (not skip_duplicates) and first_item.can_enqueue
+            items.append(
+                UrlImportPlanItem(
+                    index=index,
+                    client_item_id=client_item_id,
+                    url=url,
+                    filename=first_item.filename,
+                    content_type=first_item.content_type,
+                    file_size=first_item.file_size,
+                    status="duplicate_in_batch",
+                    severity="warning" if can_enqueue else "blocked",
+                    can_enqueue=can_enqueue,
+                    reason_code="duplicate_url_in_batch",
+                    reason="Duplicate URL in this batch" if can_enqueue else "Duplicate URL points to a blocked or failed item",
+                    content_sha256=first_item.content_sha256,
+                    content_length=first_item.content_length,
+                    estimated_chunks=first_item.estimated_chunks,
+                    duplicate_file_id=first_item.duplicate_file_id,
+                    duplicate_of=first_item.client_item_id,
+                )
+            )
+            continue
+        item = await plan_single_url_import(
+            settings,
+            index=index,
+            client_item_id=client_item_id,
+            url=url,
+            user_id=user_id,
+            knowledge_base_id=knowledge_base_id,
+            skip_duplicates=skip_duplicates,
+        )
+        seen_urls[normalized_url] = item
+        if item.content_sha256 and item.content_sha256 in seen_hashes:
+            item = item.model_copy(
+                update={
+                    "status": "duplicate_in_batch",
+                    "severity": "blocked" if skip_duplicates else "warning",
+                    "can_enqueue": not skip_duplicates,
+                    "reason_code": "duplicate_content_in_batch",
+                    "reason": "Same parsed content appears earlier in this batch",
+                    "duplicate_of": seen_hashes[item.content_sha256],
+                }
+            )
+        elif item.content_sha256:
+            seen_hashes[item.content_sha256] = item.client_item_id
+        items.append(item)
+    blocked_count = sum(1 for item in items if item.severity == "blocked")
+    return UrlImportPlanResponse(
+        plan_id=plan_id,
+        knowledge_base_id=knowledge_base_id,
+        created_at=now.isoformat(),
+        expires_at=expires_at.isoformat(),
+        total=len(items),
+        ready_count=sum(1 for item in items if item.can_enqueue),
+        warning_count=sum(1 for item in items if item.severity == "warning"),
+        blocked_count=blocked_count,
+        duplicate_count=sum(1 for item in items if item.status in {"duplicate_existing", "duplicate_in_batch"}),
+        invalid_count=sum(1 for item in items if item.status == "invalid_url"),
+        error_count=sum(1 for item in items if item.status in {"url_fetch_failed", "empty_content", "parse_failed", "system_error"}),
+        items=items,
+    )
+
+
+async def plan_single_url_import(
+    settings: AppSettings,
+    *,
+    index: int,
+    client_item_id: str,
+    url: str,
+    user_id: str,
+    knowledge_base_id: str,
+    skip_duplicates: bool,
+) -> UrlImportPlanItem:
+    parsed_url = urlsplit(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        return UrlImportPlanItem(
+            index=index,
+            client_item_id=client_item_id,
+            url=url,
+            status="invalid_url",
+            severity="blocked",
+            can_enqueue=False,
+            reason_code="invalid_url",
+            reason="Only http(s) URLs are supported",
+        )
+    if not is_public_http_url(parsed_url.hostname):
+        return UrlImportPlanItem(
+            index=index,
+            client_item_id=client_item_id,
+            url=url,
+            status="invalid_url",
+            severity="blocked",
+            can_enqueue=False,
+            reason_code="private_or_local_host",
+            reason="Private, local, or reserved hosts are not allowed",
+        )
+    try:
+        html = await asyncio.to_thread(_fetch_url, url, 10)
+        parsed = parse_html(_slugify(_extract_title(html) or url) + ".html", html)
+        content = parsed.text.strip()
+        if not content:
+            return UrlImportPlanItem(
+                index=index,
+                client_item_id=client_item_id,
+                url=url,
+                status="empty_content",
+                severity="blocked",
+                can_enqueue=False,
+                reason_code="empty_content",
+                reason="No extractable text found",
+            )
+        content_sha256 = hash_text(content)
+        duplicate = await find_file_by_content_hash(
+            settings,
+            user_id=user_id,
+            content_sha256=content_sha256,
+            knowledge_base_id=knowledge_base_id,
+        )
+        title = _extract_title(html)
+        filename = f"{_slugify(title or url)}.html"
+        _, chunks = build_chunks_from_text(
+            filename=filename,
+            content_type=parsed.content_type,
+            text=content,
+            settings=settings,
+            document_id=str(uuid4()),
+            content_sha256=content_sha256,
+            user_id=user_id,
+            knowledge_base_id=knowledge_base_id,
+            source_type="url",
+            source_uri=url,
+        )
+        if duplicate:
+            return UrlImportPlanItem(
+                index=index,
+                client_item_id=client_item_id,
+                url=url,
+                filename=filename,
+                content_type=parsed.content_type,
+                file_size=len(html.encode("utf-8")),
+                status="duplicate_existing",
+                severity="blocked" if skip_duplicates else "warning",
+                can_enqueue=not skip_duplicates,
+                reason_code="duplicate_existing",
+                reason="Same content already exists in this knowledge base",
+                content_sha256=content_sha256,
+                content_length=len(content),
+                estimated_chunks=len(chunks),
+                duplicate_file_id=duplicate.id,
+            )
+        return UrlImportPlanItem(
+            index=index,
+            client_item_id=client_item_id,
+            url=url,
+            filename=filename,
+            content_type=parsed.content_type,
+            file_size=len(html.encode("utf-8")),
+            status="ready",
+            severity="pass",
+            can_enqueue=True,
+            content_sha256=content_sha256,
+            content_length=len(content),
+            estimated_chunks=len(chunks),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return UrlImportPlanItem(
+            index=index,
+            client_item_id=client_item_id,
+            url=url,
+            status="url_fetch_failed",
+            severity="blocked",
+            can_enqueue=False,
+            reason_code="url_fetch_failed",
+            reason=str(exc)[:1000],
+        )
+
+
+def normalize_url(url: str) -> str:
+    parsed = urlsplit(url.strip())
+    return parsed._replace(fragment="").geturl().rstrip("/")
+
+
+def is_public_http_url(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    host = hostname.strip().lower().rstrip(".")
+    if host in {"localhost"} or host.endswith(".localhost") or host.endswith(".local"):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
 
 
 def safe_upload_path(upload_storage_dir: str, source_uri: str) -> Path | None:

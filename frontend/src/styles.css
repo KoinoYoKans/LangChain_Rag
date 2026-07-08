@@ -227,6 +227,11 @@ body {
   margin-bottom: 16px;
 }
 
+.stacked-form {
+  display: grid;
+  gap: 8px;
+}
+
 .grow {
   flex: 1;
   min-width: 280px;
@@ -239,6 +244,12 @@ body {
 .page-preview {
   display: grid;
   gap: 14px;
+}
+
+.import-plan {
+  margin-bottom: 16px;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 14px;
 }
 
 .page-text {

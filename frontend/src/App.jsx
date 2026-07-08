@@ -168,6 +168,8 @@ function KnowledgeWorkspace({ api, user }) {
   const [fileStatus, setFileStatus] = useState("");
   const [selectedFileIds, setSelectedFileIds] = useState([]);
   const [selectedJobIds, setSelectedJobIds] = useState([]);
+  const [urlPlan, setUrlPlan] = useState(null);
+  const [selectedUrlItemIds, setSelectedUrlItemIds] = useState([]);
   const [kbForm] = Form.useForm();
   const [editForm] = Form.useForm();
   const [memberForm] = Form.useForm();
@@ -212,6 +214,11 @@ function KnowledgeWorkspace({ api, user }) {
   useEffect(() => {
     if (!selectedKb && kbs.data?.[0]?.id) setSelectedKb(kbs.data[0].id);
   }, [kbs.data, selectedKb]);
+  useEffect(() => {
+    setUrlPlan(null);
+    setSelectedUrlItemIds([]);
+    urlForm.resetFields(["urls"]);
+  }, [activeKb, urlForm]);
 
   const createKb = useMutation({
     mutationFn: (values) => api.post("/knowledge-bases", values),
@@ -241,11 +248,28 @@ function KnowledgeWorkspace({ api, user }) {
     onError: (error) => message.error(readError(error)),
   });
   const ingestUrl = useMutation({
-    mutationFn: (values) => api.post(`/knowledge-bases/${activeKb}/urls`, values),
-    onSuccess: () => {
+    mutationFn: (values) => api.post(`/knowledge-bases/${activeKb}/urls/plan`, {
+      urls: splitUrls(values.urls),
+      skip_duplicates: values.skip_duplicates !== false,
+    }),
+    onSuccess: ({ data }) => {
+      setUrlPlan(data);
+      setSelectedUrlItemIds((data.items || []).filter((item) => item.can_enqueue && item.severity === "pass").map((item) => item.client_item_id));
+      message.success(`校验完成：可入队 ${data.ready_count}，阻断 ${data.blocked_count}`);
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  const commitUrlPlan = useMutation({
+    mutationFn: () => api.post(`/knowledge-bases/${activeKb}/urls/batch`, {
+      plan_id: urlPlan.plan_id,
+      client_item_ids: selectedUrlItemIds,
+    }),
+    onSuccess: ({ data }) => {
       urlForm.resetFields();
+      setUrlPlan(null);
+      setSelectedUrlItemIds([]);
       refreshKnowledge(queryClient, activeKb);
-      message.success("URL 已加入入库队列");
+      message.success(`确认入队完成：成功 ${data.succeeded}，失败 ${data.failed}，跳过 ${data.skipped || 0}`);
     },
     onError: (error) => message.error(readError(error)),
   });
@@ -439,12 +463,49 @@ function KnowledgeWorkspace({ api, user }) {
           <p><CloudUploadOutlined /></p>
           <p>拖拽或点击上传文档</p>
         </Upload.Dragger>
-        <Form form={urlForm} className="url-form" layout="inline" onFinish={(values) => ingestUrl.mutate(values)}>
-          <Form.Item name="url" rules={[{ required: true }]} className="grow">
-            <Input placeholder="https://example.com/docs/page" />
+        <Form form={urlForm} className="url-form stacked-form" layout="vertical" onFinish={(values) => ingestUrl.mutate(values)}>
+          <Form.Item name="urls" rules={[{ required: true }]} className="grow">
+            <Input.TextArea rows={4} placeholder="每行一个 URL，先校验再确认入队" />
           </Form.Item>
-          <Button type="primary" htmlType="submit" loading={ingestUrl.isPending}>导入 URL</Button>
+          <Space wrap>
+            <Form.Item name="skip_duplicates" initialValue={true} valuePropName="checked" noStyle>
+              <Switch checkedChildren="跳过重复" unCheckedChildren="允许重复" />
+            </Form.Item>
+            <Button type="primary" htmlType="submit" loading={ingestUrl.isPending}>开始校验</Button>
+            <Button disabled={!urlPlan || !selectedUrlItemIds.length} loading={commitUrlPlan.isPending} onClick={() => commitUrlPlan.mutate()}>确认入队</Button>
+          </Space>
         </Form>
+        {urlPlan && (
+          <div className="import-plan">
+            <Flex justify="space-between" align="center" className="table-tools">
+              <Space wrap>
+                <Tag color="blue">总数 {urlPlan.total}</Tag>
+                <Tag color="green">可入队 {urlPlan.ready_count}</Tag>
+                <Tag color="orange">警告 {urlPlan.warning_count}</Tag>
+                <Tag color="red">阻断 {urlPlan.blocked_count}</Tag>
+              </Space>
+              <span className="muted">计划过期：{formatTime(urlPlan.expires_at)}</span>
+            </Flex>
+            <Table
+              rowKey="client_item_id"
+              size="small"
+              pagination={{ pageSize: 5 }}
+              dataSource={urlPlan.items || []}
+              rowSelection={{
+                selectedRowKeys: selectedUrlItemIds,
+                onChange: setSelectedUrlItemIds,
+                getCheckboxProps: (row) => ({ disabled: !row.can_enqueue }),
+              }}
+              columns={[
+                { title: "URL", dataIndex: "url", ellipsis: true },
+                { title: "状态", dataIndex: "status", width: 160, render: (value, row) => <Tag color={planStatusColor(row)}>{value}</Tag> },
+                { title: "原因", dataIndex: "reason", ellipsis: true, render: (value) => value || "-" },
+                { title: "分块", dataIndex: "estimated_chunks", width: 80, render: (value) => value ?? "-" },
+                { title: "重复", width: 120, render: (_, row) => row.duplicate_file_id?.slice(0, 8) || row.duplicate_of || "-" },
+              ]}
+            />
+          </div>
+        )}
         <Flex justify="space-between" align="center" className="table-tools">
           <Typography.Title level={5}>文件</Typography.Title>
           <Space wrap>
@@ -1218,6 +1279,16 @@ function formatTime(value) {
 function scoreText(value) {
   if (value == null) return "-";
   return Number(value).toFixed(3);
+}
+
+function splitUrls(value = "") {
+  return String(value).split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+}
+
+function planStatusColor(row) {
+  if (row.severity === "pass") return "green";
+  if (row.severity === "warning") return "orange";
+  return "red";
 }
 
 function confidenceText(value, score) {

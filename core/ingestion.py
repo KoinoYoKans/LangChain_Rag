@@ -48,6 +48,9 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
         source = _load_job_source(job.payload, job.source_type, job.source_uri, job.filename)
         parsed = source["parsed"]
         content_sha256 = hash_text(parsed.text)
+        planned_content_sha256 = str(job.payload.get("planned_content_sha256") or "")
+        if planned_content_sha256 and planned_content_sha256 != content_sha256:
+            raise ValueError("URL content changed since import plan; rerun dry-run before confirming")
         await mark_job_progress(settings, job_id, 25)
         await _raise_if_cancelled(settings, job_id)
         existing = await find_file_by_content_hash(
@@ -240,9 +243,9 @@ def _load_job_source(payload: dict[str, Any], source_type: str, source_uri: str 
     raise ValueError(f"Unsupported ingest source_type: {source_type}")
 
 
-def _fetch_url(url: str) -> str:
+def _fetch_url(url: str, timeout_seconds: int = 20) -> str:
     request = Request(url, headers={"User-Agent": "LangChain-RagBot/1.0"})
-    with urlopen(request, timeout=20) as response:  # noqa: S310
+    with urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310
         charset = response.headers.get_content_charset() or "utf-8"
         return response.read().decode(charset, errors="ignore")
 
