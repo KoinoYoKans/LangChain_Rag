@@ -104,8 +104,9 @@ def similarity_search(
     query: str,
     top_k: int,
     user_id: str,
+    knowledge_base_id: str | None = None,
 ) -> list[Document]:
-    metadata_filter = {"user_id": user_id}
+    metadata_filter = {"knowledge_base_id": knowledge_base_id} if knowledge_base_id else {"user_id": user_id}
     if hasattr(vector_store, "similarity_search_with_score"):
         docs_with_scores = vector_store.similarity_search_with_score(query, k=top_k, filter=metadata_filter)
         documents: list[Document] = []

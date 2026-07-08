@@ -20,6 +20,8 @@ from config.settings import AppSettings
 @dataclass(frozen=True)
 class Conversation:
     id: str
+    org_id: str | None
+    knowledge_base_id: str | None
     user_id: str
     title: str | None
     created_at: datetime
@@ -29,6 +31,8 @@ class Conversation:
 @dataclass(frozen=True)
 class ChatMessage:
     id: str
+    org_id: str | None
+    knowledge_base_id: str | None
     conversation_id: str
     user_id: str
     role: str
@@ -45,11 +49,15 @@ async def ensure_conversation(
     settings: AppSettings,
     *,
     conversation_id: str,
+    org_id: str | None = None,
+    knowledge_base_id: str | None = None,
     user_id: str,
     title: str | None = None,
 ) -> Conversation:
     stmt = insert(RagConversationModel).values(
         id=UUID(conversation_id),
+        org_id=UUID(org_id) if org_id else None,
+        knowledge_base_id=UUID(knowledge_base_id) if knowledge_base_id else None,
         user_id=user_id,
         title=title,
     )
@@ -72,6 +80,8 @@ async def add_message(
     *,
     message_id: str,
     conversation_id: str,
+    org_id: str | None = None,
+    knowledge_base_id: str | None = None,
     user_id: str,
     role: str,
     content: str,
@@ -79,6 +89,8 @@ async def add_message(
 ) -> ChatMessage:
     message = RagMessageModel(
         id=UUID(message_id),
+        org_id=UUID(org_id) if org_id else None,
+        knowledge_base_id=UUID(knowledge_base_id) if knowledge_base_id else None,
         conversation_id=UUID(conversation_id),
         user_id=user_id,
         role=role,
@@ -139,6 +151,8 @@ async def list_conversations(
 def _model_to_conversation(model: RagConversationModel) -> Conversation:
     return Conversation(
         id=str(model.id),
+        org_id=str(model.org_id) if model.org_id else None,
+        knowledge_base_id=str(model.knowledge_base_id) if model.knowledge_base_id else None,
         user_id=model.user_id,
         title=model.title,
         created_at=model.created_at,
@@ -149,6 +163,8 @@ def _model_to_conversation(model: RagConversationModel) -> Conversation:
 def _model_to_message(model: RagMessageModel) -> ChatMessage:
     return ChatMessage(
         id=str(model.id),
+        org_id=str(model.org_id) if model.org_id else None,
+        knowledge_base_id=str(model.knowledge_base_id) if model.knowledge_base_id else None,
         conversation_id=str(model.conversation_id),
         user_id=model.user_id,
         role=model.role,
@@ -161,6 +177,8 @@ def _model_to_message(model: RagMessageModel) -> ChatMessage:
 def _row_to_message(row: Any) -> ChatMessage:
     return ChatMessage(
         id=str(row["id"]),
+        org_id=str(row["org_id"]) if row.get("org_id") else None,
+        knowledge_base_id=str(row["knowledge_base_id"]) if row.get("knowledge_base_id") else None,
         conversation_id=str(row["conversation_id"]),
         user_id=row["user_id"],
         role=row["role"],

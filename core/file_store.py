@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import delete, select
+from sqlalchemy import update as sqlalchemy_update
 from sqlalchemy.dialects.postgresql import insert
 
 from config.database import RagFileChunkModel, RagFileModel, build_async_session_maker, initialize_orm_tables
@@ -15,9 +16,14 @@ from config.settings import AppSettings
 @dataclass(frozen=True)
 class RagFile:
     id: str
+    org_id: str | None
+    knowledge_base_id: str | None
+    owner_user_id: str | None
     user_id: str
     filename: str
     content_type: str
+    source_type: str
+    source_uri: str | None
     file_size: int
     file_sha256: str
     content_sha256: str
@@ -38,16 +44,18 @@ async def find_file_by_content_hash(
     settings: AppSettings,
     user_id: str,
     content_sha256: str,
+    knowledge_base_id: str | None = None,
 ) -> RagFile | None:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
-        result = await session.scalar(
-            select(RagFileModel).where(
-                RagFileModel.user_id == user_id,
-                RagFileModel.content_sha256 == content_sha256,
-                RagFileModel.status.in_(("processing", "completed")),
-            )
-        )
+        conditions = [
+            RagFileModel.user_id == user_id,
+            RagFileModel.content_sha256 == content_sha256,
+            RagFileModel.status.in_(("processing", "completed")),
+        ]
+        if knowledge_base_id:
+            conditions.append(RagFileModel.knowledge_base_id == UUID(knowledge_base_id))
+        result = await session.scalar(select(RagFileModel).where(*conditions))
         return _model_to_file(result) if result else None
 
 
@@ -55,18 +63,28 @@ async def create_processing_file(
     settings: AppSettings,
     *,
     file_id: str,
+    org_id: str | None = None,
+    knowledge_base_id: str | None = None,
+    owner_user_id: str | None = None,
     user_id: str,
     filename: str,
     content_type: str,
+    source_type: str = "file",
+    source_uri: str | None = None,
     file_size: int,
     file_sha256: str,
     content_sha256: str,
 ) -> RagFile:
     file_model = RagFileModel(
         id=UUID(file_id),
+        org_id=UUID(org_id) if org_id else None,
+        knowledge_base_id=UUID(knowledge_base_id) if knowledge_base_id else None,
+        owner_user_id=UUID(owner_user_id) if owner_user_id else None,
         user_id=user_id,
         filename=filename,
         content_type=content_type,
+        source_type=source_type,
+        source_uri=source_uri,
         file_size=file_size,
         file_sha256=file_sha256,
         content_sha256=content_sha256,
@@ -123,6 +141,8 @@ async def save_file_chunks(
     settings: AppSettings,
     *,
     user_id: str,
+    org_id: str | None = None,
+    knowledge_base_id: str | None = None,
     file_id: str,
     chunks: list[tuple[str, int, str, str]],
 ) -> None:
@@ -131,12 +151,15 @@ async def save_file_chunks(
     values = [
         {
             "id": UUID(chunk_id),
+            "org_id": UUID(org_id) if org_id else None,
+            "knowledge_base_id": UUID(knowledge_base_id) if knowledge_base_id else None,
             "user_id": user_id,
             "file_id": UUID(file_id),
             "vector_id": UUID(chunk_id),
             "chunk_index": chunk_index,
             "content": content,
             "content_sha256": content_sha256,
+            "keywords": extract_keywords(content),
         }
         for chunk_id, chunk_index, content, content_sha256 in chunks
     ]
@@ -146,6 +169,9 @@ async def save_file_chunks(
         set_={
             "content": stmt.excluded.content,
             "content_sha256": stmt.excluded.content_sha256,
+            "org_id": stmt.excluded.org_id,
+            "knowledge_base_id": stmt.excluded.knowledge_base_id,
+            "keywords": stmt.excluded.keywords,
         },
     )
     session_maker = build_async_session_maker(settings)
@@ -179,6 +205,27 @@ async def list_files(settings: AppSettings, user_id: str, limit: int = 50, offse
         return [_model_to_file(item) for item in result]
 
 
+async def list_knowledge_base_files(
+    settings: AppSettings,
+    knowledge_base_id: str,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[RagFile]:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        result = await session.scalars(
+            select(RagFileModel)
+            .where(
+                RagFileModel.knowledge_base_id == UUID(knowledge_base_id),
+                RagFileModel.status != "deleted",
+            )
+            .order_by(RagFileModel.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return [_model_to_file(item) for item in result]
+
+
 async def get_file(settings: AppSettings, user_id: str, file_id: str) -> RagFile | None:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
@@ -189,6 +236,37 @@ async def get_file(settings: AppSettings, user_id: str, file_id: str) -> RagFile
             )
         )
         return _model_to_file(result) if result else None
+
+
+async def get_knowledge_base_file(settings: AppSettings, knowledge_base_id: str, file_id: str) -> RagFile | None:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        result = await session.scalar(
+            select(RagFileModel).where(
+                RagFileModel.id == UUID(file_id),
+                RagFileModel.knowledge_base_id == UUID(knowledge_base_id),
+                RagFileModel.status != "deleted",
+            )
+        )
+        return _model_to_file(result) if result else None
+
+
+async def delete_file_chunks_by_file_id(settings: AppSettings, file_id: str) -> None:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(delete(RagFileChunkModel).where(RagFileChunkModel.file_id == UUID(file_id)))
+
+
+async def mark_file_deleted(settings: AppSettings, file_id: str) -> None:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            await session.execute(
+                sqlalchemy_update(RagFileModel)
+                .where(RagFileModel.id == UUID(file_id))
+                .values(status="deleted", deleted_at=datetime.utcnow())
+            )
 
 
 async def delete_file_record(settings: AppSettings, user_id: str, file_id: str) -> RagFile | None:
@@ -210,9 +288,14 @@ async def delete_file_record(settings: AppSettings, user_id: str, file_id: str) 
 def _model_to_file(model: RagFileModel) -> RagFile:
     return RagFile(
         id=str(model.id),
+        org_id=str(model.org_id) if model.org_id else None,
+        knowledge_base_id=str(model.knowledge_base_id) if model.knowledge_base_id else None,
+        owner_user_id=str(model.owner_user_id) if model.owner_user_id else None,
         user_id=model.user_id,
         filename=model.filename,
         content_type=model.content_type,
+        source_type=model.source_type,
+        source_uri=model.source_uri,
         file_size=int(model.file_size),
         file_sha256=model.file_sha256,
         content_sha256=model.content_sha256,
@@ -224,3 +307,23 @@ def _model_to_file(model: RagFileModel) -> RagFile:
         created_at=model.created_at,
         updated_at=model.updated_at,
     )
+
+
+def extract_keywords(text: str, limit: int = 24) -> list[str]:
+    try:
+        import jieba
+
+        words = jieba.lcut(text)
+    except Exception:  # noqa: BLE001
+        words = text.split()
+    seen: set[str] = set()
+    result: list[str] = []
+    for word in words:
+        value = word.strip().lower()
+        if len(value) < 2 or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+        if len(result) >= limit:
+            break
+    return result

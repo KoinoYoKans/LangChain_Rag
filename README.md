@@ -1,39 +1,89 @@
 # LangChain_Rag
 
-FastAPI RAG Agent with:
+Enterprise knowledge-base Q&A service with FastAPI, React, pgvector, Redis-backed ingestion jobs, local Qwen3 embedding/rerank models, and an OpenAI-compatible chat model.
 
-- OpenAI-compatible chat model from `.env`
-- Local Qwen embedding model via `sentence-transformers`
-- Local Qwen3 rerank model via `transformers`
-- PostgreSQL + pgvector persistence
-- SQLAlchemy async ORM with asyncpg for files, chunks, conversations, and messages
+## What Is Included
 
-## Run
+- Account/password login with JWT.
+- Organization, department, user, role, and knowledge-base ACLs.
+- File ingestion for `.txt`, `.md`, `.pdf`, `.docx`.
+- Web URL ingestion with HTML text extraction.
+- Redis queue plus a dedicated worker for parsing, chunking, embedding, and pgvector writes.
+- PostgreSQL tables for files, chunks, conversations, ingest jobs, audit logs, and chat logs.
+- React + Vite management console for knowledge bases, ingestion, chat, users/departments, and audit logs.
 
-```powershell
+## Local Run
+
+```bash
 python -m venv .venv
-.\.venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
 uvicorn core.main:app --host 127.0.0.1 --port 8000
 ```
 
-Required `.env` keys:
+Run the worker in another terminal:
+
+```bash
+source .venv/bin/activate
+python worker.py
+```
+
+Run the frontend:
+
+```bash
+cd frontend
+npm install
+VITE_API_BASE=http://127.0.0.1:8000 npm run dev
+```
+
+## Required Configuration
+
+The service reads `.env`.
 
 - `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`
 - `LOCAL_EMBEDDING_MODEL_PATH`, `EMBEDDING_DIMENSION`
-- `LOCAL_RERANK_MODEL_PATH` when `RERANK_TOP_N > 0` and `RERANK_PROVIDER=local`
-- `POSTGRES_DSN` or `PG_HOST`, `PG_USER`, `PG_PWD`, `PG_DATABASE`
-- `PGVECTOR_TABLE`, `RAG_FILE_TABLE`, `RAG_CHUNK_TABLE`
-- `RAG_CONVERSATION_TABLE`, `RAG_MESSAGE_TABLE`, `CHAT_HISTORY_LIMIT`
+- `LOCAL_RERANK_MODEL_PATH`, `RERANK_TOP_N`
+- `POSTGRES_DSN`
+- `REDIS_URL`
+- `JWT_SECRET`
+- `DEFAULT_ADMIN_EMAIL`, `DEFAULT_ADMIN_PASSWORD`
 
-APIs:
+On startup, the API creates the default organization, department, and admin user if they do not exist.
 
+## API Overview
+
+- `POST /auth/login`
+- `GET /auth/me`
+- `GET/POST /departments`
+- `GET/POST /users`
+- `GET/POST /knowledge-bases`
+- `POST /knowledge-bases/{id}/documents`
+- `POST /knowledge-bases/{id}/urls`
+- `GET /knowledge-bases/{id}/ingest-jobs`
+- `GET /knowledge-bases/{id}/documents`
+- `POST /chat`
+- `GET /audit-logs`
 - `GET /health`
-- `POST /documents` multipart form: `user_id` plus `.txt`, `.md`, `.pdf`, `.docx` file
-- `GET /documents?user_id=...`
-- `GET /documents/{file_id}?user_id=...`
-- `DELETE /documents/{file_id}?user_id=...`
-- `GET /conversations?user_id=...`
-- `POST /chat` JSON body: `{"user_id": "...", "message": "...", "conversation_id": null, "top_k": 8, "rerank_top_n": 4}`
 
-Document content is deduplicated per `user_id`. File records include `chunk_ids`, and chat retrieval is filtered by `user_id`.
+`POST /chat` requires `knowledge_base_id` and uses the authenticated user's ACL to filter access.
+
+## Docker Compose
+
+```bash
+docker compose up --build
+```
+
+The Compose file starts:
+
+- `api` on port `8000`
+- `worker`
+- `frontend` on port `8080`
+
+It expects PostgreSQL and Redis connection strings in `.env`. Model paths are mounted into the containers as `/models/embedding` and `/models/reranker`.
+
+## Security Notes
+
+- Replace `JWT_SECRET` and default admin password before exposing the service.
+- Do not commit `.env`.
+- PostgreSQL and Redis should not be open to `0.0.0.0/0` in production; restrict access to the API/worker host or private network.

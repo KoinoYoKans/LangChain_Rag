@@ -50,6 +50,14 @@ class AppSettings:
     app_host: str
     app_port: int
     log_level: str
+    jwt_secret: str
+    jwt_ttl_minutes: int
+    redis_url: str | None
+    upload_storage_dir: str
+    default_org_name: str
+    default_department_name: str
+    default_admin_email: str
+    default_admin_password: str
     openai_api_key: str | None
     openai_base_url: str | None
     openai_model: str
@@ -90,6 +98,14 @@ class AppSettings:
             app_host=os.getenv("APP_HOST", "127.0.0.1"),
             app_port=_as_int("APP_PORT", 8000),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            jwt_secret=os.getenv("JWT_SECRET", "change-me-in-production"),
+            jwt_ttl_minutes=_as_int("JWT_TTL_MINUTES", 1440),
+            redis_url=os.getenv("REDIS_URL"),
+            upload_storage_dir=os.getenv("UPLOAD_STORAGE_DIR", "storage/uploads"),
+            default_org_name=os.getenv("DEFAULT_ORG_NAME", "Default Organization"),
+            default_department_name=os.getenv("DEFAULT_DEPARTMENT_NAME", "Default Department"),
+            default_admin_email=os.getenv("DEFAULT_ADMIN_EMAIL", "admin@example.com"),
+            default_admin_password=os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123456"),
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_base_url=os.getenv("OPENAI_BASE_URL"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
@@ -139,6 +155,16 @@ class AppSettings:
             errors.append("OPENAI_MODEL is required")
         if not self.postgres_dsn:
             errors.append("POSTGRES_DSN is required for pgvector persistence")
+        if not self.redis_url:
+            errors.append("REDIS_URL is required for ingest job queue")
+        if not self.jwt_secret:
+            errors.append("JWT_SECRET is required")
+        if self.jwt_ttl_minutes <= 0:
+            errors.append("JWT_TTL_MINUTES must be greater than 0")
+        if not self.default_admin_email:
+            errors.append("DEFAULT_ADMIN_EMAIL is required")
+        if not self.default_admin_password:
+            errors.append("DEFAULT_ADMIN_PASSWORD is required")
         if self.embedding_dimension <= 0:
             errors.append("EMBEDDING_DIMENSION must be greater than 0")
         if self.rag_top_k <= 0:

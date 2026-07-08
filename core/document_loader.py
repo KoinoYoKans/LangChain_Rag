@@ -11,7 +11,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config.settings import AppSettings
 
-SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx"}
+SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx", ".html"}
 
 
 def _decode_text(data: bytes) -> str:
@@ -46,6 +46,10 @@ def extract_text(filename: str, data: bytes) -> str:
         raise ValueError(f"Unsupported document type: {extension or '<none>'}. Supported: {supported}")
     if extension in {".txt", ".md"}:
         return _decode_text(data)
+    if extension == ".html":
+        from core.document_parser import parse_document
+
+        return parse_document(filename, data, "text/html").text
     if extension == ".pdf":
         return _read_pdf(data)
     if extension == ".docx":
@@ -75,6 +79,10 @@ def build_chunks(
     document_id: str | None = None,
     content_sha256: str | None = None,
     user_id: str = "default",
+    org_id: str | None = None,
+    knowledge_base_id: str | None = None,
+    source_type: str = "file",
+    source_uri: str | None = None,
 ) -> tuple[str, list[Document]]:
     text = extract_text(filename, data).strip()
     resolved_document_id = document_id or str(uuid4())
@@ -87,6 +95,10 @@ def build_chunks(
         document_id=resolved_document_id,
         content_sha256=resolved_content_sha256,
         user_id=user_id,
+        org_id=org_id,
+        knowledge_base_id=knowledge_base_id,
+        source_type=source_type,
+        source_uri=source_uri,
     )
 
 
@@ -98,6 +110,10 @@ def build_chunks_from_text(
     document_id: str,
     content_sha256: str,
     user_id: str,
+    org_id: str | None = None,
+    knowledge_base_id: str | None = None,
+    source_type: str = "file",
+    source_uri: str | None = None,
 ) -> tuple[str, list[Document]]:
     text = text.strip()
     if not text:
@@ -116,9 +132,13 @@ def build_chunks_from_text(
             metadata={
                 "document_id": document_id,
                 "file_id": document_id,
+                "org_id": org_id,
+                "knowledge_base_id": knowledge_base_id,
                 "user_id": user_id,
                 "filename": filename,
                 "content_type": content_type or "application/octet-stream",
+                "source_type": source_type,
+                "source_uri": source_uri,
                 "content_sha256": content_sha256,
                 "chunk_index": index,
                 "upload_time": upload_time,
