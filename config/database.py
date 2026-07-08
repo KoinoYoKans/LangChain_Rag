@@ -168,10 +168,23 @@ class ChatLogModel(Base):
     org_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     knowledge_base_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     user_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    api_key_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
     conversation_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    assistant_message_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    request_id: Mapped[str | None] = mapped_column(Text)
     question: Mapped[str] = mapped_column(Text, nullable=False)
     answer: Mapped[str] = mapped_column(Text, nullable=False)
     sources: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    model_name: Mapped[str | None] = mapped_column(Text)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    source_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    citation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    citation_coverage: Mapped[float | None] = mapped_column(Float)
+    answer_status: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[str | None] = mapped_column(Text)
+    confidence_score: Mapped[float | None] = mapped_column(Float)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -390,6 +403,7 @@ async def _migrate_existing_tables(connection: Any, settings: AppSettings) -> No
     chunk_table = settings.rag_chunk_table
     conversation_table = settings.rag_conversation_table
     message_table = settings.rag_message_table
+    chat_log_table = os.getenv("CHAT_LOG_TABLE", "rag_chat_logs")
 
     for table_name in (file_table, chunk_table, conversation_table, message_table):
         await connection.execute(text(f'alter table "{table_name}" add column if not exists org_id uuid'))
@@ -423,6 +437,30 @@ async def _migrate_existing_tables(connection: Any, settings: AppSettings) -> No
     await connection.execute(text(f'alter table "{chunk_table}" add column if not exists user_id text not null default \'default\''))
     await connection.execute(text(f'alter table "{chunk_table}" add column if not exists keywords text[] not null default \'{{}}\''))
     await connection.execute(text(f'alter table "{message_table}" add column if not exists org_id uuid'))
+    chat_log_columns = {
+        "api_key_id": "uuid",
+        "assistant_message_id": "uuid",
+        "request_id": "text",
+        "model_name": "text",
+        "prompt_tokens": "integer",
+        "completion_tokens": "integer",
+        "total_tokens": "integer",
+        "source_count": "integer not null default 0",
+        "citation_count": "integer not null default 0",
+        "citation_coverage": "double precision",
+        "answer_status": "text",
+        "confidence": "text",
+        "confidence_score": "double precision",
+    }
+    for column, column_type in chat_log_columns.items():
+        await connection.execute(text(f'alter table "{chat_log_table}" add column if not exists {column} {column_type}'))
+    await connection.execute(
+        text(
+            f'update "{chat_log_table}" '
+            "set source_count = jsonb_array_length(sources) "
+            "where source_count = 0 and sources is not null and jsonb_typeof(sources) = 'array'"
+        )
+    )
 
     await connection.execute(text('alter table "rag_users" add column if not exists last_login_at timestamp with time zone'))
     audit_columns = {

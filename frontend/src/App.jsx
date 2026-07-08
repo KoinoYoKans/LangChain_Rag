@@ -899,7 +899,11 @@ function ChatWorkspace({ api }) {
               { value: "answer_wrong", label: "答案不正确" },
               { value: "source_missing", label: "缺少引用" },
               { value: "source_mismatch", label: "引用不匹配" },
+              { value: "not_answered", label: "没有回答问题" },
+              { value: "content_outdated", label: "内容过时" },
+              { value: "permission_leak", label: "权限不应可见" },
               { value: "unclear", label: "表达不清楚" },
+              { value: "other", label: "其他" },
             ]}
             onChange={(value) => { reason = value; }}
           />
@@ -1217,13 +1221,103 @@ function ApiKeyWorkspace({ api }) {
 }
 
 function AuditWorkspace({ api }) {
+  const [chatFilters, setChatFilters] = useState({ feedback_rating: "", answer_status: "", knowledge_base_id: "", low_confidence: false, no_citations: false });
+  const [chatOperation, setChatOperation] = useState(null);
+  const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
   const logs = useQuery({ queryKey: ["audit"], refetchInterval: 5000, queryFn: async () => (await api.get("/audit-logs")).data.items || [] });
   const feedback = useQuery({ queryKey: ["feedback"], refetchInterval: 10000, queryFn: async () => (await api.get("/feedback")).data.items || [] });
+  const chatOperations = useQuery({
+    queryKey: ["chat-operations", chatFilters],
+    refetchInterval: 10000,
+    queryFn: async () => (await api.get("/chat-operations", { params: compactParams(chatFilters) })).data.items || [],
+  });
+  const exportChatOperations = useMutation({
+    mutationFn: async () => api.get("/chat-operations/export", { params: compactParams(chatFilters), responseType: "blob" }),
+    onSuccess: ({ data }) => {
+      const url = URL.createObjectURL(data);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "chat-operations.csv";
+      link.click();
+      URL.revokeObjectURL(url);
+    },
+    onError: (error) => message.error(readError(error)),
+  });
+  function updateChatFilter(key, value) {
+    setChatFilters((filters) => ({ ...filters, [key]: value }));
+  }
   return (
     <section className="surface full">
       <PageTitle title="审计与反馈" subtitle="记录用户操作、请求上下文和回答质量反馈。" />
       <Tabs
         items={[
+          {
+            key: "chatOps",
+            label: "问答运营",
+            children: (
+              <>
+                <Space className="table-tools" wrap>
+                  <Select
+                    allowClear
+                    placeholder="知识库"
+                    value={chatFilters.knowledge_base_id || undefined}
+                    style={{ width: 220 }}
+                    onChange={(value) => updateChatFilter("knowledge_base_id", value || "")}
+                    options={(kbs.data || []).filter((item) => item.can_manage_settings).map((item) => ({ value: item.id, label: item.name }))}
+                  />
+                  <Select
+                    allowClear
+                    placeholder="反馈"
+                    value={chatFilters.feedback_rating || undefined}
+                    style={{ width: 140 }}
+                    onChange={(value) => updateChatFilter("feedback_rating", value || "")}
+                    options={[
+                      { value: "up", label: "有帮助" },
+                      { value: "down", label: "无帮助" },
+                      { value: "unrated", label: "未评价" },
+                    ]}
+                  />
+                  <Select
+                    allowClear
+                    placeholder="答案状态"
+                    value={chatFilters.answer_status || undefined}
+                    style={{ width: 160 }}
+                    onChange={(value) => updateChatFilter("answer_status", value || "")}
+                    options={[
+                      { value: "supported", label: "引用已验证" },
+                      { value: "citation_missing", label: "缺少引用" },
+                      { value: "citation_invalid", label: "引用无效" },
+                      { value: "citation_incomplete", label: "引用不完整" },
+                      { value: "no_sources", label: "无证据" },
+                    ]}
+                  />
+                  <Switch checked={chatFilters.low_confidence} onChange={(value) => updateChatFilter("low_confidence", value)} checkedChildren="低可信" unCheckedChildren="低可信" />
+                  <Switch checked={chatFilters.no_citations} onChange={(value) => updateChatFilter("no_citations", value)} checkedChildren="无引用" unCheckedChildren="无引用" />
+                  <Button onClick={() => exportChatOperations.mutate()} loading={exportChatOperations.isPending}>导出 CSV</Button>
+                </Space>
+                <Table
+                  rowKey="id"
+                  loading={chatOperations.isLoading}
+                  dataSource={chatOperations.data || []}
+                  expandable={{ expandedRowRender: (row) => <ChatOperationDetail row={row} /> }}
+                  columns={[
+                    { title: "问题", dataIndex: "question", ellipsis: true },
+                    { title: "状态", dataIndex: "answer_status", width: 130, render: answerStatusText },
+                    { title: "反馈", dataIndex: "feedback_rating", width: 90, render: (value) => value ? <Tag color={value === "up" ? "green" : "red"}>{value === "up" ? "赞" : "踩"}</Tag> : "-" },
+                    { title: "引用", width: 90, render: (_, row) => `${row.citation_count || 0}/${row.source_count || 0}` },
+                    { title: "可信度", dataIndex: "confidence", width: 110, render: (value, row) => <Tag color={confidenceColor(value)}>{confidenceText(value, row.confidence_score)}</Tag> },
+                    { title: "耗时", dataIndex: "latency_ms", width: 100, render: (value) => value == null ? "-" : `${value}ms` },
+                    { title: "估算Tokens", dataIndex: "total_tokens", width: 110, render: (value) => value ?? "-" },
+                    { title: "时间", dataIndex: "created_at", width: 180, render: formatTime },
+                    { title: "详情", width: 80, render: (_, row) => <Button size="small" onClick={() => setChatOperation(row)}>查看</Button> },
+                  ]}
+                />
+                <Drawer width="72vw" title="问答详情" open={Boolean(chatOperation)} onClose={() => setChatOperation(null)}>
+                  {chatOperation && <ChatOperationDetail row={chatOperation} />}
+                </Drawer>
+              </>
+            ),
+          },
           {
             key: "audit",
             label: "审计日志",
@@ -1282,6 +1376,53 @@ function PageTitle({ title, subtitle }) {
   );
 }
 
+function ChatOperationDetail({ row }) {
+  return (
+    <Space direction="vertical" size={16} className="full-select">
+      <Descriptions
+        bordered
+        column={2}
+        size="small"
+        items={[
+          { key: "request_id", label: "Request ID", children: row.request_id || "-" },
+          { key: "kb", label: "知识库", children: row.knowledge_base_id },
+          { key: "user", label: "用户", children: row.user_id },
+          { key: "api_key", label: "API Key", children: row.api_key_id || "-" },
+          { key: "model", label: "模型", children: row.model_name || "-" },
+          { key: "latency", label: "耗时", children: row.latency_ms == null ? "-" : `${row.latency_ms}ms` },
+          { key: "tokens", label: "估算 Token", children: row.total_tokens ?? "-" },
+          { key: "feedback", label: "反馈", children: row.feedback_rating || "-" },
+        ]}
+      />
+      <Typography.Title level={5}>问题</Typography.Title>
+      <Typography.Paragraph>{row.question}</Typography.Paragraph>
+      <Typography.Title level={5}>回答</Typography.Title>
+      <Typography.Paragraph className="answer-content">{row.answer}</Typography.Paragraph>
+      <Typography.Title level={5}>引用来源</Typography.Title>
+      <Table
+        rowKey={(source, index) => `${source.chunk_id || source.source_index}-${index}`}
+        size="small"
+        pagination={false}
+        dataSource={row.sources || []}
+        columns={[
+          { title: "引用", dataIndex: "source_index", width: 70, render: (value) => `[${value || "-"}]` },
+          { title: "文件", dataIndex: "filename" },
+          { title: "分块", dataIndex: "chunk_index", width: 80 },
+          { title: "页码", dataIndex: "page_number", width: 80, render: (value) => value || "-" },
+          { title: "分数", width: 120, render: (_, source) => scoreText(source.rerank_score ?? source.hybrid_score ?? source.vector_score) },
+          { title: "片段", dataIndex: "snippet" },
+        ]}
+      />
+      {row.feedback_comment && (
+        <>
+          <Typography.Title level={5}>反馈说明</Typography.Title>
+          <Typography.Paragraph>{row.feedback_reason || "-"}：{row.feedback_comment}</Typography.Paragraph>
+        </>
+      )}
+    </Space>
+  );
+}
+
 function EmptyText({ text }) {
   return <div className="empty-text">{text}</div>;
 }
@@ -1319,7 +1460,7 @@ function buildChatRecordsFromMessages(items) {
         sources: item.metadata?.sources || [],
         confidence: item.metadata?.confidence || "medium",
         confidence_score: item.metadata?.confidence_score,
-        answer_status: item.metadata?.answer_status || "supported",
+        answer_status: item.metadata?.answer_status || "unknown",
         citation_count: item.metadata?.citation_count || 0,
         citation_coverage: item.metadata?.citation_coverage || 0,
       });
@@ -1401,8 +1542,9 @@ function answerStatusText(value) {
     citation_invalid: "引用无效",
     citation_incomplete: "引用不完整",
     interrupted: "未完成",
+    unknown: "未知/历史",
   };
-  return labels[value] || value || "引用已验证";
+  return labels[value] || value || "未知/历史";
 }
 
 function readError(error) {
@@ -1410,6 +1552,12 @@ function readError(error) {
   if (typeof detail === "string") return detail;
   if (detail?.message) return detail.message;
   return error?.message || "请求失败";
+}
+
+function compactParams(values = {}) {
+  return Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value !== "" && value !== undefined && value !== null && value !== false)
+  );
 }
 
 function formatTime(value) {

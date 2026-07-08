@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import ipaddress
 import re
 import time
@@ -57,6 +59,7 @@ from core.enterprise_store import (
     get_knowledge_base_stats,
     list_knowledge_base_members,
     list_audit_logs,
+    list_chat_operations,
     list_departments,
     list_knowledge_bases,
     list_users,
@@ -190,6 +193,39 @@ class FeedbackResponse(BaseModel):
 
 class FeedbackListResponse(BaseModel):
     items: list[FeedbackResponse]
+
+
+class ChatOperationResponse(BaseModel):
+    id: str
+    org_id: str
+    knowledge_base_id: str
+    user_id: str
+    api_key_id: str | None = None
+    conversation_id: str
+    assistant_message_id: str | None = None
+    request_id: str | None = None
+    question: str
+    answer: str
+    sources: list[dict[str, Any]]
+    source_count: int
+    citation_count: int
+    citation_coverage: float | None = None
+    answer_status: str | None = None
+    confidence: str | None = None
+    confidence_score: float | None = None
+    model_name: str | None = None
+    latency_ms: int | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    feedback_rating: str | None = None
+    feedback_reason: str | None = None
+    feedback_comment: str | None = None
+    created_at: str
+
+
+class ChatOperationListResponse(BaseModel):
+    items: list[ChatOperationResponse]
 
 
 class DocumentUploadResponse(BaseModel):
@@ -1989,6 +2025,7 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="Invalid conversation_id") from exc
         started_at = time.perf_counter()
+        request_context = audit_context(http_request)
         try:
             try:
                 await ensure_conversation(
@@ -2097,9 +2134,20 @@ def create_app() -> FastAPI:
                 knowledge_base_id=request.knowledge_base_id,
                 user_id=current_user.id,
                 conversation_id=conversation_id,
+                assistant_message_id=assistant_message.id,
+                request_id=request_context["request_id"],
                 question=request.message,
                 answer=str(answer),
                 sources=[source.model_dump() for source in sources],
+                model_name=state.settings.openai_model,
+                prompt_tokens=len(request.message) // 4,
+                completion_tokens=len(str(answer)) // 4,
+                total_tokens=(len(request.message) + len(str(answer))) // 4,
+                citation_count=int(citation_result["citation_count"]),
+                citation_coverage=float(citation_result["citation_coverage"]),
+                answer_status=str(citation_result["answer_status"]),
+                confidence=confidence,
+                confidence_score=confidence_score,
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
             )
             await add_audit_log(
@@ -2120,7 +2168,7 @@ def create_app() -> FastAPI:
                 },
                 actor_department_id=current_user.department_id,
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
-                **audit_context(http_request),
+                **request_context,
             )
         except HTTPException:
             raise
@@ -2136,7 +2184,7 @@ def create_app() -> FastAPI:
                 result="failed",
                 error_message="Chat model request timed out",
                 metadata={"conversation_id": conversation_id, "query": request.message},
-                **audit_context(http_request),
+                **request_context,
             )
             raise HTTPException(
                 status_code=504,
@@ -2154,7 +2202,7 @@ def create_app() -> FastAPI:
                 result="failed",
                 error_message=str(exc)[:1000],
                 metadata={"conversation_id": conversation_id, "query": request.message},
-                **audit_context(http_request),
+                **request_context,
             )
             raise HTTPException(status_code=500, detail={"message": f"问答失败：{exc}", "stage": "chat"}) from exc
 
@@ -2267,6 +2315,86 @@ def create_app() -> FastAPI:
             ]
         )
 
+    @app.get("/chat-operations", response_model=ChatOperationListResponse)
+    async def chat_operations(
+        knowledge_base_id: str | None = Query(default=None),
+        feedback_rating: str | None = Query(default=None, pattern="^(up|down|unrated)$"),
+        answer_status: str | None = Query(default=None),
+        low_confidence: bool = Query(default=False),
+        no_citations: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=500),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> ChatOperationListResponse:
+        require_manager(current_user)
+        state = get_state(app)
+        allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
+        return ChatOperationListResponse(
+            items=[
+                ChatOperationResponse(**item)
+                for item in await list_chat_operations(
+                    state.settings,
+                    org_id=current_user.org_id,
+                    knowledge_base_ids=allowed_kb_ids,
+                    limit=limit,
+                    knowledge_base_id=knowledge_base_id,
+                    feedback_rating=feedback_rating,
+                    answer_status=answer_status,
+                    low_confidence=low_confidence,
+                    no_citations=no_citations,
+                )
+            ]
+        )
+
+    @app.get("/chat-operations/export")
+    async def export_chat_operations(
+        knowledge_base_id: str | None = Query(default=None),
+        feedback_rating: str | None = Query(default=None, pattern="^(up|down|unrated)$"),
+        answer_status: str | None = Query(default=None),
+        low_confidence: bool = Query(default=False),
+        no_citations: bool = Query(default=False),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> Response:
+        require_manager(current_user)
+        state = get_state(app)
+        allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
+        rows = await list_chat_operations(
+            state.settings,
+            org_id=current_user.org_id,
+            knowledge_base_ids=allowed_kb_ids,
+            limit=500,
+            knowledge_base_id=knowledge_base_id,
+            feedback_rating=feedback_rating,
+            answer_status=answer_status,
+            low_confidence=low_confidence,
+            no_citations=no_citations,
+        )
+        buffer = io.StringIO()
+        writer = csv.DictWriter(
+            buffer,
+            fieldnames=[
+                "created_at",
+                "knowledge_base_id",
+                "question",
+                "feedback_rating",
+                "feedback_reason",
+                "source_count",
+                "citation_count",
+                "answer_status",
+                "confidence",
+                "latency_ms",
+                "total_tokens",
+                "request_id",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: csv_safe(row.get(key)) for key in writer.fieldnames})
+        return Response(
+            content=buffer.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="chat-operations.csv"'},
+        )
+
     @app.post("/v1/knowledge/{knowledge_base_id}/retrieval", response_model=RetrievalResponse)
     async def open_retrieval(
         http_request: Request,
@@ -2352,6 +2480,7 @@ def create_app() -> FastAPI:
         state = require_ready(app)
         api_key = await require_valid_api_key(state.settings, authorization, x_api_key)
         started_at = time.perf_counter()
+        request_context = audit_context(http_request)
         question = next((message.content for message in reversed(request.messages) if message.role == "user"), "")
         if not question:
             raise HTTPException(status_code=400, detail="At least one user message is required")
@@ -2410,15 +2539,28 @@ def create_app() -> FastAPI:
         sources = [source.model_dump() for source in source_models]
         conversation_id = request.conversation_id or str(uuid4())
         latency_ms = int((time.perf_counter() - started_at) * 1000)
+        prompt_tokens = sum(len(message.content) for message in request.messages) // 4
+        completion_tokens = len(answer) // 4
         await add_chat_log(
             state.settings,
             org_id=api_key.org_id,
             knowledge_base_id=api_key.knowledge_base_id,
             user_id=api_key.user_id,
+            api_key_id=api_key.id,
             conversation_id=conversation_id,
+            request_id=request_context["request_id"],
             question=question,
             answer=answer,
             sources=sources,
+            model_name=request.model or state.settings.openai_model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            citation_count=int(citation_result["citation_count"]),
+            citation_coverage=float(citation_result["citation_coverage"]),
+            answer_status=str(citation_result["answer_status"]),
+            confidence=confidence,
+            confidence_score=confidence_score,
             latency_ms=latency_ms,
         )
         await add_audit_log(
@@ -2437,10 +2579,8 @@ def create_app() -> FastAPI:
                 "answer_status": citation_result["answer_status"],
             },
             latency_ms=latency_ms,
-            **audit_context(http_request),
+            **request_context,
         )
-        prompt_tokens = sum(len(message.content) for message in request.messages) // 4
-        completion_tokens = len(answer) // 4
         return {
             "id": f"chatcmpl-{uuid4().hex}",
             "object": "chat.completion",
@@ -2944,6 +3084,22 @@ async def require_kb_api_key_admin(settings: AppSettings, kb_id: str, user: Curr
     if capabilities.can_manage_api_keys:
         return
     raise HTTPException(status_code=403, detail="Knowledge base API key management denied")
+
+
+async def manageable_knowledge_base_ids(settings: AppSettings, user: CurrentUser) -> list[str]:
+    return [
+        kb.id
+        for kb in await list_knowledge_bases(settings, user)
+        if (await get_knowledge_base_capabilities(settings, kb.id, user)).can_manage_settings
+    ]
+
+
+def csv_safe(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    if value.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return f"'{value}"
+    return value
 
 
 def build_reindex_payload(settings: AppSettings, item: RagFile) -> tuple[dict[str, Any], str | None]:

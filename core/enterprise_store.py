@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from config.database import (
@@ -13,6 +13,7 @@ from config.database import (
     AuditLogModel,
     ChatLogModel,
     DepartmentModel,
+    FeedbackModel,
     IngestJobModel,
     KnowledgeBaseMemberModel,
     KnowledgeBaseModel,
@@ -644,22 +645,138 @@ async def add_chat_log(
     answer: str,
     sources: list[dict[str, Any]],
     latency_ms: int | None,
+    api_key_id: str | None = None,
+    assistant_message_id: str | None = None,
+    request_id: str | None = None,
+    model_name: str | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    total_tokens: int | None = None,
+    citation_count: int = 0,
+    citation_coverage: float | None = None,
+    answer_status: str | None = None,
+    confidence: str | None = None,
+    confidence_score: float | None = None,
 ) -> None:
     row = ChatLogModel(
         id=uuid4(),
         org_id=UUID(org_id),
         knowledge_base_id=UUID(knowledge_base_id),
         user_id=UUID(user_id),
+        api_key_id=UUID(api_key_id) if api_key_id else None,
         conversation_id=UUID(conversation_id),
+        assistant_message_id=UUID(assistant_message_id) if assistant_message_id else None,
+        request_id=request_id,
         question=question,
         answer=answer,
         sources=sources,
+        model_name=model_name,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        source_count=len(sources),
+        citation_count=citation_count,
+        citation_coverage=citation_coverage,
+        answer_status=answer_status,
+        confidence=confidence,
+        confidence_score=confidence_score,
         latency_ms=latency_ms,
     )
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:
         async with session.begin():
             session.add(row)
+
+
+async def list_chat_operations(
+    settings: AppSettings,
+    *,
+    org_id: str,
+    knowledge_base_ids: list[str],
+    limit: int = 100,
+    knowledge_base_id: str | None = None,
+    feedback_rating: str | None = None,
+    answer_status: str | None = None,
+    low_confidence: bool = False,
+    no_citations: bool = False,
+) -> list[dict[str, Any]]:
+    if not knowledge_base_ids:
+        return []
+    allowed_ids = {UUID(item) for item in knowledge_base_ids}
+    selected_ids = allowed_ids
+    if knowledge_base_id:
+        requested_id = UUID(knowledge_base_id)
+        if requested_id not in allowed_ids:
+            return []
+        selected_ids = {requested_id}
+    conditions = [
+        ChatLogModel.org_id == UUID(org_id),
+        ChatLogModel.knowledge_base_id.in_(list(selected_ids)),
+    ]
+    if answer_status:
+        conditions.append(ChatLogModel.answer_status == answer_status)
+    if low_confidence:
+        conditions.append(ChatLogModel.confidence == "low")
+    if no_citations:
+        conditions.append(ChatLogModel.citation_count == 0)
+    join_condition = and_(
+        FeedbackModel.org_id == ChatLogModel.org_id,
+        FeedbackModel.knowledge_base_id == ChatLogModel.knowledge_base_id,
+        FeedbackModel.conversation_id == ChatLogModel.conversation_id,
+        FeedbackModel.user_id == ChatLogModel.user_id,
+        FeedbackModel.assistant_message_id == ChatLogModel.assistant_message_id,
+    )
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        rows = await session.execute(
+            select(ChatLogModel, FeedbackModel)
+            .outerjoin(FeedbackModel, join_condition)
+            .where(*conditions)
+            .order_by(ChatLogModel.created_at.desc())
+            .limit(limit if feedback_rating is None else min(max(limit * 5, limit), 1000))
+        )
+        items = []
+        for chat_log, feedback in rows:
+            if feedback_rating:
+                if feedback_rating == "unrated" and feedback is not None:
+                    continue
+                if feedback_rating in {"up", "down"} and (feedback is None or feedback.rating != feedback_rating):
+                    continue
+            items.append(chat_operation_to_dict(chat_log, feedback))
+            if len(items) >= limit:
+                break
+        return items
+
+
+def chat_operation_to_dict(chat_log: ChatLogModel, feedback: FeedbackModel | None = None) -> dict[str, Any]:
+    return {
+        "id": str(chat_log.id),
+        "org_id": str(chat_log.org_id),
+        "knowledge_base_id": str(chat_log.knowledge_base_id),
+        "user_id": str(chat_log.user_id),
+        "api_key_id": str(chat_log.api_key_id) if chat_log.api_key_id else None,
+        "conversation_id": str(chat_log.conversation_id),
+        "assistant_message_id": str(chat_log.assistant_message_id) if chat_log.assistant_message_id else None,
+        "request_id": chat_log.request_id,
+        "question": chat_log.question,
+        "answer": chat_log.answer,
+        "sources": list(chat_log.sources or []),
+        "source_count": int(chat_log.source_count or 0),
+        "citation_count": int(chat_log.citation_count or 0),
+        "citation_coverage": float(chat_log.citation_coverage) if chat_log.citation_coverage is not None else None,
+        "answer_status": chat_log.answer_status,
+        "confidence": chat_log.confidence,
+        "confidence_score": float(chat_log.confidence_score) if chat_log.confidence_score is not None else None,
+        "model_name": chat_log.model_name,
+        "latency_ms": chat_log.latency_ms,
+        "prompt_tokens": chat_log.prompt_tokens,
+        "completion_tokens": chat_log.completion_tokens,
+        "total_tokens": chat_log.total_tokens,
+        "feedback_rating": feedback.rating if feedback else None,
+        "feedback_reason": feedback.reason if feedback else None,
+        "feedback_comment": feedback.comment if feedback else None,
+        "created_at": chat_log.created_at.isoformat(),
+    }
 
 
 async def _can_access_kb_model(session: Any, kb: KnowledgeBaseModel, user: Any, write: bool) -> bool:
