@@ -533,6 +533,7 @@ class KnowledgeBaseResponse(BaseModel):
     can_manage_members: bool = False
     can_manage_settings: bool = False
     can_manage_api_keys: bool = False
+    has_full_access: bool = False
     created_at: str
     updated_at: str
 
@@ -1132,13 +1133,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseResponse:
         settings = get_state(app).settings
-        await require_kb_capability_or_audit(
+        await require_kb_full_access_or_audit(
             settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="knowledge_base.update.denied",
-            capability="settings",
         )
         kb = await update_knowledge_base(
             settings,
@@ -1185,13 +1185,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseResponse:
         settings = get_state(app).settings
-        await require_kb_capability_or_audit(
+        await require_kb_full_access_or_audit(
             settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="knowledge_base.delete.denied",
-            capability="settings",
         )
         kb = await soft_delete_knowledge_base(settings, kb_id=knowledge_base_id, user=current_user)
         await add_audit_log(
@@ -1235,20 +1234,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseMemberListResponse:
         settings = get_state(app).settings
-        await require_kb_access_or_audit(
+        await require_kb_full_access_or_audit(
             settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="knowledge_base.members.denied",
-        )
-        await require_kb_capability_or_audit(
-            settings,
-            request=http_request,
-            kb_id=knowledge_base_id,
-            user=current_user,
-            action="knowledge_base.members.denied",
-            capability="members",
         )
         return KnowledgeBaseMemberListResponse(
             items=[
@@ -1264,13 +1255,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> dict[str, list[UserResponse]]:
         settings = get_state(app).settings
-        await require_kb_capability_or_audit(
+        await require_kb_full_access_or_audit(
             settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="knowledge_base.member_candidates.denied",
-            capability="members",
         )
         return {"items": [user_response(item) for item in await list_users(settings, current_user.org_id) if item.is_active]}
 
@@ -1281,26 +1271,14 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseGrantListResponse:
         settings = get_state(app).settings
-        await require_kb_access_or_audit(
+        await require_kb_full_access_or_audit(
             settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="knowledge_base.grants.denied",
         )
-        capabilities = await get_knowledge_base_capabilities(settings, knowledge_base_id, current_user)
         grants = await list_knowledge_base_grants(settings, knowledge_base_id)
-        if not capabilities.can_manage_members:
-            grants = [
-                item
-                for item in grants
-                if (item.subject_type == "user" and item.subject_id == current_user.id)
-                or (
-                    item.subject_type == "department"
-                    and current_user.department_id is not None
-                    and item.subject_id == current_user.department_id
-                )
-            ]
         return KnowledgeBaseGrantListResponse(items=[kb_grant_response(item) for item in grants])
 
     @app.put("/knowledge-bases/{knowledge_base_id}/grants", response_model=KnowledgeBaseGrantResponse)
@@ -1311,21 +1289,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseGrantResponse:
         settings = get_state(app).settings
-        await require_kb_access_or_audit(
+        await require_kb_full_access_or_audit(
             settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="knowledge_base.grant_upsert.denied",
-            write=True,
-        )
-        await require_kb_capability_or_audit(
-            settings,
-            request=http_request,
-            kb_id=knowledge_base_id,
-            user=current_user,
-            action="knowledge_base.grant_upsert.denied",
-            capability="members",
             metadata={"subject_type": request.subject_type, "subject_id": request.subject_id},
         )
         grant, old_role = await upsert_knowledge_base_grant(
@@ -1374,21 +1343,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> dict[str, str]:
         settings = get_state(app).settings
-        await require_kb_access_or_audit(
+        await require_kb_full_access_or_audit(
             settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="knowledge_base.grant_remove.denied",
-            write=True,
-        )
-        await require_kb_capability_or_audit(
-            settings,
-            request=http_request,
-            kb_id=knowledge_base_id,
-            user=current_user,
-            action="knowledge_base.grant_remove.denied",
-            capability="members",
             metadata={"grant_id": grant_id},
         )
         grant = await remove_knowledge_base_grant(settings, kb_id=knowledge_base_id, grant_id=grant_id)
@@ -1429,21 +1389,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> KnowledgeBaseMemberResponse:
         settings = get_state(app).settings
-        await require_kb_access_or_audit(
+        await require_kb_full_access_or_audit(
             settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="knowledge_base.member_upsert.denied",
-            write=True,
-        )
-        await require_kb_capability_or_audit(
-            settings,
-            request=http_request,
-            kb_id=knowledge_base_id,
-            user=current_user,
-            action="knowledge_base.member_upsert.denied",
-            capability="members",
         )
         member = await upsert_knowledge_base_member(
             settings,
@@ -1484,21 +1435,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> dict[str, str]:
         settings = get_state(app).settings
-        await require_kb_access_or_audit(
+        await require_kb_full_access_or_audit(
             settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="knowledge_base.member_remove.denied",
-            write=True,
-        )
-        await require_kb_capability_or_audit(
-            settings,
-            request=http_request,
-            kb_id=knowledge_base_id,
-            user=current_user,
-            action="knowledge_base.member_remove.denied",
-            capability="members",
         )
         revoked_key_count = await revoke_api_keys_for_kb_user(settings, kb_id=knowledge_base_id, user_id=member_user_id)
         await remove_knowledge_base_member(settings, kb_id=knowledge_base_id, user_id=member_user_id)
@@ -1520,11 +1462,10 @@ def create_app() -> FastAPI:
         limit: int = Query(default=100, ge=1, le=500),
         current_user: CurrentUser = Depends(require_current_user),
     ) -> AuditLogListResponse:
-        require_manager(current_user)
         settings = get_state(app).settings
         knowledge_base_ids = None
         if not current_user.is_admin:
-            knowledge_base_ids = await manageable_knowledge_base_ids(settings, current_user)
+            knowledge_base_ids = await full_access_knowledge_base_ids(settings, current_user)
         return AuditLogListResponse(
             items=await list_audit_logs(
                 settings,
@@ -1537,15 +1478,11 @@ def create_app() -> FastAPI:
     @app.get("/api-keys", response_model=ApiKeyListResponse)
     async def api_keys(current_user: CurrentUser = Depends(require_current_user)) -> ApiKeyListResponse:
         settings = get_state(app).settings
-        manageable_kb_ids = [
-            kb.id
-            for kb in await list_knowledge_bases(settings, current_user)
-            if (await get_knowledge_base_capabilities(settings, kb.id, current_user)).can_manage_api_keys
-        ]
+        full_access_kb_ids = await full_access_knowledge_base_ids(settings, current_user)
         return ApiKeyListResponse(
             items=[
                 api_key_response(item)
-                for item in await list_api_keys(settings, current_user.org_id, knowledge_base_ids=manageable_kb_ids)
+                for item in await list_api_keys(settings, current_user.org_id, knowledge_base_ids=full_access_kb_ids)
             ]
         )
 
@@ -1565,13 +1502,12 @@ def create_app() -> FastAPI:
                 is_past_expiry = expires_at <= now
             if is_past_expiry:
                 raise HTTPException(status_code=422, detail="API key expiry must be in the future")
-        await require_kb_capability_or_audit(
+        await require_kb_full_access_or_audit(
             state.settings,
             request=http_request,
             kb_id=request.knowledge_base_id,
             user=current_user,
             action="api_key.create.denied",
-            capability="api_keys",
         )
         created = await create_api_key(
             state.settings,
@@ -1595,6 +1531,7 @@ def create_app() -> FastAPI:
             metadata={
                 "name": created.record.name,
                 "knowledge_base_id": request.knowledge_base_id,
+                "key_prefix": created.record.key_prefix,
                 "expires_at": created.record.expires_at.isoformat() if created.record.expires_at else None,
                 "daily_request_limit": created.record.daily_request_limit,
                 "daily_token_limit": created.record.daily_token_limit,
@@ -1613,13 +1550,12 @@ def create_app() -> FastAPI:
         existing = await get_api_key(state.settings, current_user.org_id, api_key_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="API key not found")
-        await require_kb_capability_or_audit(
+        await require_kb_full_access_or_audit(
             state.settings,
             request=http_request,
             kb_id=existing.knowledge_base_id,
             user=current_user,
             action="api_key.revoke.denied",
-            capability="api_keys",
         )
         revoked = await revoke_api_key(state.settings, current_user.org_id, api_key_id)
         if revoked is None:
@@ -1632,7 +1568,14 @@ def create_app() -> FastAPI:
             action="api_key.revoke",
             target_type="api_key",
             target_id=revoked.id,
-            metadata={"name": revoked.name, "knowledge_base_id": revoked.knowledge_base_id},
+            metadata={
+                "name": revoked.name,
+                "knowledge_base_id": revoked.knowledge_base_id,
+                "key_prefix": revoked.key_prefix,
+                "expires_at": revoked.expires_at.isoformat() if revoked.expires_at else None,
+                "daily_request_limit": revoked.daily_request_limit,
+                "daily_token_limit": revoked.daily_token_limit,
+            },
             **audit_context(http_request),
         )
         return api_key_response(revoked)
@@ -3123,16 +3066,15 @@ def create_app() -> FastAPI:
         state = require_ready(app)
         allowed_kb_ids = None
         if knowledge_base_id:
-            await require_kb_capability_or_audit(
+            await require_kb_full_access_or_audit(
                 state.settings,
                 request=http_request,
                 kb_id=knowledge_base_id,
                 user=current_user,
                 action="feedback.list.denied",
-                capability="settings",
             )
         elif not current_user.is_admin:
-            allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
+            allowed_kb_ids = await full_access_knowledge_base_ids(state.settings, current_user)
         return FeedbackListResponse(
             items=[
                 feedback_response(item)
@@ -3149,6 +3091,7 @@ def create_app() -> FastAPI:
 
     @app.get("/chat-operations", response_model=ChatOperationListResponse)
     async def chat_operations(
+        http_request: Request,
         knowledge_base_id: str | None = Query(default=None),
         feedback_rating: str | None = Query(default=None, pattern="^(up|down|unrated)$"),
         answer_status: str | None = Query(default=None),
@@ -3158,7 +3101,15 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> ChatOperationListResponse:
         state = get_state(app)
-        allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
+        allowed_kb_ids = await full_access_knowledge_base_ids(state.settings, current_user)
+        if knowledge_base_id:
+            await require_kb_full_access_or_audit(
+                state.settings,
+                request=http_request,
+                kb_id=knowledge_base_id,
+                user=current_user,
+                action="chat_operations.list.denied",
+            )
         rows = await list_chat_operations(
             state.settings,
             org_id=current_user.org_id,
@@ -3180,6 +3131,7 @@ def create_app() -> FastAPI:
 
     @app.get("/chat-operations/export")
     async def export_chat_operations(
+        http_request: Request,
         knowledge_base_id: str | None = Query(default=None),
         feedback_rating: str | None = Query(default=None, pattern="^(up|down|unrated)$"),
         answer_status: str | None = Query(default=None),
@@ -3188,7 +3140,15 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> Response:
         state = get_state(app)
-        allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
+        allowed_kb_ids = await full_access_knowledge_base_ids(state.settings, current_user)
+        if knowledge_base_id:
+            await require_kb_full_access_or_audit(
+                state.settings,
+                request=http_request,
+                kb_id=knowledge_base_id,
+                user=current_user,
+                action="chat_operations.export.denied",
+            )
         rows = await list_chat_operations(
             state.settings,
             org_id=current_user.org_id,
@@ -3241,13 +3201,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> QualityIssueResponse:
         state = get_state(app)
-        await require_kb_capability_or_audit(
+        await require_kb_full_access_or_audit(
             state.settings,
             request=http_request,
             kb_id=request.knowledge_base_id,
             user=current_user,
             action="quality_issue.create.denied",
-            capability="settings",
             metadata={"assistant_message_id": request.assistant_message_id, "chat_log_id": request.chat_log_id},
         )
         if not request.assistant_message_id and not request.chat_log_id:
@@ -3295,6 +3254,7 @@ def create_app() -> FastAPI:
 
     @app.get("/quality-issues", response_model=QualityIssueListResponse)
     async def quality_issue_list_endpoint(
+        http_request: Request,
         knowledge_base_id: str | None = Query(default=None),
         status: str | None = Query(default=None, pattern="^(open|in_progress|resolved|ignored)$"),
         assignee_user_id: str | None = Query(default=None),
@@ -3303,7 +3263,15 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> QualityIssueListResponse:
         state = get_state(app)
-        allowed_kb_ids = await manageable_knowledge_base_ids(state.settings, current_user)
+        allowed_kb_ids = await full_access_knowledge_base_ids(state.settings, current_user)
+        if knowledge_base_id:
+            await require_kb_full_access_or_audit(
+                state.settings,
+                request=http_request,
+                kb_id=knowledge_base_id,
+                user=current_user,
+                action="quality_issue.list.denied",
+            )
         try:
             issues = await list_quality_issues(
                 state.settings,
@@ -3331,13 +3299,12 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> dict[str, list[UserResponse]]:
         state = get_state(app)
-        await require_kb_capability_or_audit(
+        await require_kb_full_access_or_audit(
             state.settings,
             request=http_request,
             kb_id=knowledge_base_id,
             user=current_user,
             action="quality_issue.assignees.denied",
-            capability="settings",
         )
         return {
             "items": [
@@ -3363,13 +3330,12 @@ def create_app() -> FastAPI:
             raise quality_issue_value_error(exc) from exc
         if issue is None:
             raise HTTPException(status_code=404, detail="Quality issue not found")
-        await require_kb_capability_or_audit(
+        await require_kb_full_access_or_audit(
             state.settings,
             request=http_request,
             kb_id=issue.knowledge_base_id,
             user=current_user,
             action="quality_issue.detail.denied",
-            capability="settings",
             metadata={"quality_issue_id": issue.id},
         )
         return quality_issue_response(issue)
@@ -3388,13 +3354,12 @@ def create_app() -> FastAPI:
             raise quality_issue_value_error(exc) from exc
         if existing is None:
             raise HTTPException(status_code=404, detail="Quality issue not found")
-        await require_kb_capability_or_audit(
+        await require_kb_full_access_or_audit(
             state.settings,
             request=http_request,
             kb_id=existing.knowledge_base_id,
             user=current_user,
             action="quality_issue.update.denied",
-            capability="settings",
             metadata={"quality_issue_id": existing.id},
         )
         update_values = request.model_dump(exclude_unset=True)
@@ -4341,6 +4306,7 @@ def kb_response(kb: Any, stats: Any | None = None, capabilities: Any | None = No
         can_manage_members=bool(getattr(capabilities, "can_manage_members", False)),
         can_manage_settings=bool(getattr(capabilities, "can_manage_settings", False)),
         can_manage_api_keys=bool(getattr(capabilities, "can_manage_api_keys", False)),
+        has_full_access=has_full_kb_access(capabilities) if capabilities else False,
         created_at=kb.created_at.isoformat(),
         updated_at=kb.updated_at.isoformat(),
     )
@@ -4844,6 +4810,7 @@ async def audit_access_denied(
     metadata: dict[str, Any] | None = None,
 ) -> None:
     try:
+        context = audit_context(request)
         await add_audit_log(
             settings,
             org_id=user.org_id,
@@ -4854,8 +4821,12 @@ async def audit_access_denied(
             target_id=target_id,
             result="failed",
             error_message=str(error.detail)[:1000],
-            metadata=metadata or {},
-            **audit_context(request),
+            metadata={
+                "actor_department_id": user.department_id,
+                "request_id": context["request_id"],
+                **(metadata or {}),
+            },
+            **context,
         )
     except Exception:
         return
@@ -4922,6 +4893,38 @@ async def require_kb_capability_or_audit(
         raise
 
 
+async def require_kb_full_access_or_audit(
+    settings: AppSettings,
+    *,
+    request: Request,
+    kb_id: str,
+    user: CurrentUser,
+    action: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        capabilities = await get_knowledge_base_capabilities(settings, kb_id, user)
+        if not has_full_kb_access(capabilities):
+            raise HTTPException(status_code=403, detail="Full knowledge base access required")
+    except HTTPException as exc:
+        if exc.status_code in {403, 404}:
+            await audit_access_denied(
+                settings,
+                request=request,
+                user=user,
+                action=action,
+                target_type="knowledge_base",
+                target_id=kb_id,
+                error=exc,
+                metadata={
+                    "knowledge_base_id": kb_id,
+                    "required_capability": "full_access",
+                    **(metadata or {}),
+                },
+            )
+        raise
+
+
 async def reconcile_stale_pending_jobs_or_audit(settings: AppSettings, *, request: Request, knowledge_base_id: str) -> None:
     stale_jobs = await mark_stale_pending_jobs_failed(settings, knowledge_base_id)
     for job in stale_jobs:
@@ -4947,11 +4950,19 @@ async def reconcile_stale_pending_jobs_or_audit(settings: AppSettings, *, reques
         )
 
 
-async def manageable_knowledge_base_ids(settings: AppSettings, user: CurrentUser) -> list[str]:
+def has_full_kb_access(capabilities: Any) -> bool:
+    return bool(
+        getattr(capabilities, "can_manage_members", False)
+        and getattr(capabilities, "can_manage_settings", False)
+        and getattr(capabilities, "can_manage_api_keys", False)
+    )
+
+
+async def full_access_knowledge_base_ids(settings: AppSettings, user: CurrentUser) -> list[str]:
     return [
         kb.id
         for kb in await list_knowledge_bases(settings, user)
-        if (await get_knowledge_base_capabilities(settings, kb.id, user)).can_manage_settings
+        if has_full_kb_access(await get_knowledge_base_capabilities(settings, kb.id, user))
     ]
 
 
@@ -4961,7 +4972,7 @@ async def list_quality_issue_assignees(settings: AppSettings, *, org_id: str, kb
         if not user.is_active:
             continue
         capabilities = await get_knowledge_base_capabilities(settings, kb_id, current_user_from_enterprise_user(user))
-        if capabilities.can_manage_settings:
+        if has_full_kb_access(capabilities):
             candidates.append(user)
     return candidates
 
@@ -4979,8 +4990,8 @@ async def require_quality_issue_assignee(
     if assignee is None or assignee.org_id != org_id or not assignee.is_active:
         raise HTTPException(status_code=422, detail="Assignee user not found")
     capabilities = await get_knowledge_base_capabilities(settings, kb_id, current_user_from_enterprise_user(assignee))
-    if not capabilities.can_manage_settings:
-        raise HTTPException(status_code=422, detail="Assignee must be able to manage this knowledge base")
+    if not has_full_kb_access(capabilities):
+        raise HTTPException(status_code=422, detail="Assignee must have full access to this knowledge base")
 
 
 def current_user_from_enterprise_user(user: Any) -> CurrentUser:

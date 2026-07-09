@@ -809,6 +809,13 @@ async def list_audit_logs(
                     AuditLogModel.metadata_["knowledge_base_ids"].op("?|")(array(allowed_ids)),
                 )
             )
+            query = query.where(
+                or_(
+                    AuditLogModel.target_type != "knowledge_base",
+                    AuditLogModel.target_id.is_(None),
+                    AuditLogModel.target_id.in_(allowed_ids),
+                )
+            )
         result = await session.scalars(
             query
             .order_by(AuditLogModel.created_at.desc())

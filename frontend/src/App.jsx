@@ -115,7 +115,7 @@ function Shell() {
         <div className="sider-foot">
           <div className="user-block">
             <strong>{user?.display_name || user?.email}</strong>
-            <span>{user?.role} · {user?.department_id?.slice(0, 8) || "未分配部门"}</span>
+            <span>{user?.role === "admin" ? "管理员" : user?.role === "manager" ? "经理" : "成员"} · {user?.department_id?.slice(0, 8) || "未分配部门"}</span>
           </div>
           <Button block onClick={logout}>退出登录</Button>
         </div>
@@ -148,12 +148,12 @@ function Login({ onLogin }) {
     <div className="login-screen">
       <div className="login-panel">
         <div className="login-brand"><FileSearchOutlined /> Enterprise RAG</div>
-        <Form layout="vertical" initialValues={{ email: "admin@example.com", password: "admin123456" }} onFinish={submit}>
-          <Form.Item name="email" label="邮箱" rules={[{ required: true }]}>
-            <Input size="large" />
+        <Form layout="vertical" onFinish={submit}>
+          <Form.Item name="email" label="邮箱" rules={[{ required: true }, { type: "email", message: "请输入有效的邮箱地址" }]}>
+            <Input size="large" placeholder="admin@example.com" />
           </Form.Item>
           <Form.Item name="password" label="密码" rules={[{ required: true }]}>
-            <Input.Password size="large" />
+            <Input.Password size="large" placeholder="输入密码" />
           </Form.Item>
           <Button type="primary" htmlType="submit" size="large" block loading={loading}>登录</Button>
         </Form>
@@ -180,12 +180,13 @@ function KnowledgeWorkspace({ api, user }) {
   const [urlForm] = Form.useForm();
   const grantSubjectType = Form.useWatch("subject_type", memberForm) || "user";
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
+  const fullAccessKbs = (kbs.data || []).filter(isFullAccessKb);
   const departments = useQuery({ queryKey: ["departments"], queryFn: async () => (await api.get("/departments")).data.items || [] });
-  const activeKb = selectedKb || kbs.data?.[0]?.id || "";
-  const activeKbRecord = (kbs.data || []).find((item) => item.id === activeKb);
+  const activeKb = selectedKb || fullAccessKbs[0]?.id || "";
+  const activeKbRecord = fullAccessKbs.find((item) => item.id === activeKb);
   const canWriteKb = Boolean(activeKbRecord?.can_write);
-  const canManageKb = Boolean(activeKbRecord?.can_manage_settings);
-  const canManageMembers = Boolean(activeKbRecord?.can_manage_members);
+  const canManageKb = Boolean(activeKbRecord?.has_full_access);
+  const canManageMembers = Boolean(activeKbRecord?.has_full_access);
   const memberCandidates = useQuery({
     queryKey: ["kb-member-candidates", activeKb],
     enabled: Boolean(activeKb && activeKbRecord?.can_manage_members),
@@ -226,8 +227,15 @@ function KnowledgeWorkspace({ api, user }) {
     queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/queue-health`)).data,
   });
   useEffect(() => {
-    if (!selectedKb && kbs.data?.[0]?.id) setSelectedKb(kbs.data[0].id);
-  }, [kbs.data, selectedKb]);
+    if (!kbs.data) return;
+    if (!selectedKb && fullAccessKbs[0]?.id) {
+      setSelectedKb(fullAccessKbs[0].id);
+      return;
+    }
+    if (selectedKb && !fullAccessKbs.some((item) => item.id === selectedKb)) {
+      setSelectedKb(fullAccessKbs[0]?.id || "");
+    }
+  }, [kbs.data, selectedKb, fullAccessKbs]);
   useEffect(() => {
     setUrlPlan(null);
     setSelectedUrlItemIds([]);
@@ -451,7 +459,7 @@ function KnowledgeWorkspace({ api, user }) {
           <Button type="primary" htmlType="submit" loading={createKb.isPending}>创建知识库</Button>
         </Form>
         <div className="kb-list">
-          {(kbs.data || []).map((item) => (
+          {fullAccessKbs.map((item) => (
             <div className={activeKb === item.id ? "kb-item active" : "kb-item"} key={item.id} onClick={() => setSelectedKb(item.id)}>
               <Flex justify="space-between" align="start" gap={8}>
                 <div>
@@ -459,8 +467,8 @@ function KnowledgeWorkspace({ api, user }) {
                   <span>{item.visibility} · TopK {item.retrieval_top_k || "全局"} · 重试 {item.low_confidence_max_retries ?? 1} · {item.completed_file_count}/{item.file_count} 文件</span>
                 </div>
                 <Space onClick={(event) => event.stopPropagation()}>
-              {item.can_manage_settings && <Button size="small" icon={<EditOutlined />} onClick={() => openEditKb(item)} />}
-              {item.can_manage_settings && <Button size="small" danger icon={<DeleteOutlined />} onClick={() => confirmDeleteKb(item)} />}
+              {item.has_full_access && <Button size="small" icon={<EditOutlined />} onClick={() => openEditKb(item)} />}
+              {item.has_full_access && <Button size="small" danger icon={<DeleteOutlined />} onClick={() => confirmDeleteKb(item)} />}
                 </Space>
               </Flex>
             </div>
@@ -564,6 +572,7 @@ function KnowledgeWorkspace({ api, user }) {
           size="middle"
           loading={documentTasks.isLoading}
           dataSource={documentTasks.data || []}
+          scroll={{ x: "max-content" }}
           columns={[
             { title: "文件/来源", render: (_, row) => <Space direction="vertical" size={0}><strong>{row.filename || row.source_uri || row.id}</strong><span className="muted">{row.content_type || row.source_type || "-"} · {formatBytes(row.file_size)}</span></Space> },
             { title: "状态", width: 140, render: (_, row) => <Space direction="vertical" size={0}><Tag color={taskStatusColor(row.status)}>{taskStatusText(row.status)}</Tag>{row.is_stale && <span className="danger-text">等待超时 {row.stale_seconds}s</span>}</Space> },
@@ -612,6 +621,7 @@ function KnowledgeWorkspace({ api, user }) {
           size="middle"
           loading={files.isLoading}
           dataSource={files.data || []}
+          scroll={{ x: "max-content" }}
           rowSelection={canManageKb ? { selectedRowKeys: selectedFileIds, onChange: setSelectedFileIds } : undefined}
           columns={[
             { title: "文件", dataIndex: "filename", render: (value, row) => <Space direction="vertical" size={0}><strong>{value}</strong><span className="muted">{row.content_type}</span></Space> },
@@ -802,6 +812,7 @@ function JobTable({ jobs, loading, retryJob, cancelJob, selectedJobIds, setSelec
       loading={loading}
       pagination={{ pageSize: 6 }}
       dataSource={jobs}
+      scroll={{ x: "max-content" }}
       rowSelection={canWrite ? { selectedRowKeys: selectedJobIds, onChange: setSelectedJobIds } : undefined}
       columns={[
         { title: "来源", render: (_, row) => row.filename || row.source_uri },
@@ -1244,6 +1255,7 @@ function UsersWorkspace({ api, user }) {
         <Table
           rowKey="id"
           dataSource={users.data || []}
+          scroll={{ x: "max-content" }}
           columns={[
             { title: "用户", render: (_, row) => <Space direction="vertical" size={0}><strong>{row.display_name}</strong><span className="muted">{row.email}</span></Space> },
             { title: "角色", dataIndex: "role", render: (value) => <Tag color={value === "admin" ? "red" : value === "manager" ? "gold" : "blue"}>{value}</Tag> },
@@ -1311,7 +1323,7 @@ function ApiKeyWorkspace({ api }) {
   const [form] = Form.useForm();
   const [secret, setSecret] = useState("");
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
-  const manageableKbs = (kbs.data || []).filter((item) => item.can_manage_api_keys);
+  const manageableKbs = (kbs.data || []).filter(isFullAccessKb);
   const keys = useQuery({ queryKey: ["apiKeys"], queryFn: async () => (await api.get("/api-keys")).data.items || [] });
   const createKey = useMutation({
     mutationFn: (values) => api.post("/api-keys", {
@@ -1373,6 +1385,7 @@ function ApiKeyWorkspace({ api }) {
       <Table
         rowKey="id"
         dataSource={keys.data || []}
+        scroll={{ x: "max-content" }}
         columns={[
           { title: "名称", dataIndex: "name" },
           { title: "前缀", dataIndex: "key_prefix" },
@@ -1404,7 +1417,9 @@ function AuditWorkspace({ api, user }) {
   const [issueForm] = Form.useForm();
   const [issueUpdateForm] = Form.useForm();
   const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
-  const logs = useQuery({ queryKey: ["audit"], enabled: user?.role !== "member", refetchInterval: 5000, queryFn: async () => (await api.get("/audit-logs")).data.items || [] });
+  const fullAccessKbs = (kbs.data || []).filter(isFullAccessKb);
+  const canReadOperations = Boolean(user?.role === "admin" || fullAccessKbs.length);
+  const logs = useQuery({ queryKey: ["audit"], enabled: canReadOperations, refetchInterval: 5000, queryFn: async () => (await api.get("/audit-logs")).data.items || [] });
   const feedback = useQuery({ queryKey: ["feedback"], refetchInterval: 10000, queryFn: async () => (await api.get("/feedback")).data.items || [] });
   const chatOperations = useQuery({
     queryKey: ["chat-operations", chatFilters],
@@ -1519,7 +1534,7 @@ function AuditWorkspace({ api, user }) {
                     value={chatFilters.knowledge_base_id || undefined}
                     style={{ width: 220 }}
                     onChange={(value) => updateChatFilter("knowledge_base_id", value || "")}
-                    options={(kbs.data || []).filter((item) => item.can_manage_settings).map((item) => ({ value: item.id, label: item.name }))}
+                    options={fullAccessKbs.map((item) => ({ value: item.id, label: item.name }))}
                   />
                   <Select
                     allowClear
@@ -1561,6 +1576,7 @@ function AuditWorkspace({ api, user }) {
                   rowKey="id"
                   loading={chatOperations.isLoading}
                   dataSource={chatOperations.data || []}
+                  scroll={{ x: "max-content" }}
                   expandable={{ expandedRowRender: (row) => <ChatOperationDetail row={row} /> }}
                   columns={[
                     { title: "问题", dataIndex: "question", ellipsis: true },
@@ -1602,7 +1618,7 @@ function AuditWorkspace({ api, user }) {
                     value={qualityFilters.knowledge_base_id || undefined}
                     style={{ width: 220 }}
                     onChange={(value) => updateQualityFilter("knowledge_base_id", value || "")}
-                    options={(kbs.data || []).filter((item) => item.can_manage_settings).map((item) => ({ value: item.id, label: item.name }))}
+                    options={fullAccessKbs.map((item) => ({ value: item.id, label: item.name }))}
                   />
                   <Select
                     allowClear
@@ -1628,6 +1644,7 @@ function AuditWorkspace({ api, user }) {
                   rowKey="id"
                   loading={qualityIssues.isLoading}
                   dataSource={qualityIssues.data || []}
+                  scroll={{ x: "max-content" }}
                   expandable={{ expandedRowRender: (row) => <QualityIssueDetail row={row} /> }}
                   columns={[
                     { title: "问题", dataIndex: "question", ellipsis: true },
@@ -1651,6 +1668,7 @@ function AuditWorkspace({ api, user }) {
                 rowKey="id"
                 loading={logs.isLoading}
                 dataSource={logs.data || []}
+                scroll={{ x: "max-content" }}
                 expandable={{ expandedRowRender: (row) => <pre className="json-block">{JSON.stringify(row, null, 2)}</pre> }}
                 columns={[
                   { title: "操作", dataIndex: "action" },
@@ -1673,6 +1691,7 @@ function AuditWorkspace({ api, user }) {
                 rowKey="id"
                 loading={feedback.isLoading}
                 dataSource={feedback.data || []}
+                scroll={{ x: "max-content" }}
                 expandable={{ expandedRowRender: (row) => <pre className="json-block">{JSON.stringify(row, null, 2)}</pre> }}
                 columns={[
                   { title: "评价", dataIndex: "rating", width: 90, render: (value) => <Tag color={value === "up" ? "green" : "red"}>{value === "up" ? "赞" : "踩"}</Tag> },
@@ -2015,6 +2034,13 @@ function answerStatusText(value) {
   return labels[value] || value || "未知/历史";
 }
 
+function isFullAccessKb(item) {
+  return Boolean(
+    item?.has_full_access
+    || (item?.can_manage_members && item?.can_manage_settings && item?.can_manage_api_keys)
+  );
+}
+
 function isQualityIssueCandidate(row) {
   return Boolean(
     row?.assistant_message_id
@@ -2102,7 +2128,9 @@ function compactParams(values = {}) {
 
 function formatTime(value) {
   if (!value) return "-";
-  return new Date(value).toLocaleString();
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return "-";
+  return d.toLocaleString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 }
 
 function formatBytes(value) {

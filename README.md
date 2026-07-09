@@ -1,4 +1,4 @@
-# LangChain_Rag
+1# LangChain_Rag
 
 Enterprise knowledge-base Q&A service with FastAPI, React, pgvector, Redis-backed ingestion jobs, local Qwen3 embedding/rerank models, and an OpenAI-compatible chat model.
 
