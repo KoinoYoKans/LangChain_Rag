@@ -7,6 +7,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import Header, HTTPException, status
@@ -35,12 +36,16 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def create_access_token(settings: AppSettings, user: EnterpriseUser) -> str:
-    now = int(time.time())
+    now_ms = int(time.time() * 1000)
+    user_updated_at_ms = datetime_to_epoch_ms(user.updated_at)
+    session_issued_at_ms = max(now_ms, user_updated_at_ms or 0)
+    now = session_issued_at_ms // 1000
     payload = {
         "sub": user.id,
         "org_id": user.org_id,
         "role": user.role,
         "iat": now,
+        "session_issued_at_ms": session_issued_at_ms,
         "exp": now + settings.jwt_ttl_minutes * 60,
     }
     header = {"alg": "HS256", "typ": "JWT"}
@@ -96,6 +101,8 @@ async def require_current_user(authorization: str | None = Header(default=None))
     user = await get_user_by_id(settings, user_id)
     if user is None or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User is inactive or missing")
+    if not token_matches_user_state(payload, user):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked; sign in again")
     return CurrentUser(
         id=user.id,
         org_id=user.org_id,
@@ -116,3 +123,16 @@ def _b64(value: bytes) -> str:
 
 def _b64_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def token_matches_user_state(payload: dict[str, object], user: EnterpriseUser) -> bool:
+    """Invalidate all prior sessions whenever a user identity record changes."""
+    issued_at_ms = payload.get("session_issued_at_ms")
+    if not isinstance(issued_at_ms, int) or issued_at_ms <= 0:
+        return False
+    user_updated_at_ms = datetime_to_epoch_ms(user.updated_at)
+    return user_updated_at_ms is None or user_updated_at_ms <= issued_at_ms
+
+
+def datetime_to_epoch_ms(value: datetime | None) -> int | None:
+    return int(value.timestamp() * 1000) if value else None

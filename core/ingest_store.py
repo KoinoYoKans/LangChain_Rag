@@ -120,6 +120,41 @@ async def list_recoverable_ingest_jobs(settings: AppSettings, limit: int = 50) -
         return [_job_to_dataclass(item) for item in result]
 
 
+async def list_pending_ingest_jobs(settings: AppSettings, limit: int = 50) -> list[IngestJob]:
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        result = await session.scalars(
+            select(IngestJobModel)
+            .where(IngestJobModel.status == "pending")
+            .order_by(IngestJobModel.created_at.asc())
+            .limit(limit)
+        )
+        return [_job_to_dataclass(item) for item in result]
+
+
+async def requeue_stale_running_ingest_jobs(settings: AppSettings, stale_after_seconds: int) -> int:
+    """Return jobs abandoned by a terminated worker to the durable pending queue."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
+    session_maker = build_async_session_maker(settings)
+    async with session_maker() as session:
+        async with session.begin():
+            result = await session.execute(
+                update(IngestJobModel)
+                .where(
+                    IngestJobModel.status == "running",
+                    IngestJobModel.updated_at < cutoff,
+                )
+                .values(
+                    status="pending",
+                    progress=0,
+                    retry_count=IngestJobModel.retry_count + 1,
+                    error_message="Recovered after worker lease expired.",
+                    updated_at=func.now(),
+                )
+            )
+        return int(result.rowcount or 0)
+
+
 async def get_ingest_queue_health(settings: AppSettings, knowledge_base_id: str) -> IngestQueueHealth:
     session_maker = build_async_session_maker(settings)
     async with session_maker() as session:

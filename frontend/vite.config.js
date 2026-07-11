@@ -3,6 +3,16 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "vendor-data": ["@tanstack/react-query", "axios"],
+          "vendor-antd": ["antd", "@ant-design/icons"],
+        },
+      },
+    },
+  },
   server: {
     proxy: {
       "/api": {

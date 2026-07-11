@@ -1,4 +1,37 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-Rag}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - rag_data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    env_file: .env
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - rag_data
+    restart: unless-stopped
+
   api:
     build: .
     env_file: .env
@@ -7,12 +40,26 @@ services:
       LOCAL_RERANK_MODEL_PATH: /models/reranker
     command: uvicorn core.main:app --host 0.0.0.0 --port 8000
     ports:
-      - "8000:8000"
+      - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8000}:8000"
     volumes:
       - ./storage:/app/storage
-      - /Users/fischel/model/Qwen3-Embedding-8B:/models/embedding:ro
-      - /Users/fischel/model/Qwen3-Reranker-8B:/models/reranker:ro
+      - ${HOST_EMBEDDING_MODEL_PATH:?HOST_EMBEDDING_MODEL_PATH must be set in .env}:/models/embedding:ro
+      - ${HOST_RERANK_MODEL_PATH:?HOST_RERANK_MODEL_PATH must be set in .env}:/models/reranker:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - rag_edge
+      - rag_data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   worker:
     build: .
@@ -23,8 +70,15 @@ services:
     command: python worker.py
     volumes:
       - ./storage:/app/storage
-      - /Users/fischel/model/Qwen3-Embedding-8B:/models/embedding:ro
-      - /Users/fischel/model/Qwen3-Reranker-8B:/models/reranker:ro
+      - ${HOST_EMBEDDING_MODEL_PATH:?HOST_EMBEDDING_MODEL_PATH must be set in .env}:/models/embedding:ro
+      - ${HOST_RERANK_MODEL_PATH:?HOST_RERANK_MODEL_PATH must be set in .env}:/models/reranker:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - rag_data
     restart: unless-stopped
 
   frontend:
@@ -32,5 +86,24 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    networks:
+      - rag_edge
     restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  rag_edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${RAG_EDGE_SUBNET:-172.30.0.0/24}
+  rag_data:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${RAG_DATA_SUBNET:-172.31.0.0/24}

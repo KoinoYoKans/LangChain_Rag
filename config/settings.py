@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from ipaddress import ip_network
 from pathlib import Path
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 
@@ -23,6 +24,32 @@ def _as_bool(name: str, default: bool) -> bool:
     if value is None or value == "":
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _as_csv(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def is_valid_cors_origin(origin: str) -> bool:
+    """Return whether an origin is safe to hand to browser CORS middleware."""
+    try:
+        parsed = urlsplit(origin)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        origin != "*"
+        and parsed.scheme.lower() in {"http", "https"}
+        and bool(parsed.hostname)
+        and not parsed.username
+        and not parsed.password
+        and not parsed.path
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def _build_postgres_dsn() -> str | None:
@@ -52,6 +79,20 @@ class AppSettings:
     log_level: str
     jwt_secret: str
     jwt_ttl_minutes: int
+    cors_allowed_origins: tuple[str, ...]
+    trusted_proxy_cidrs: tuple[str, ...]
+    max_upload_size_bytes: int
+    max_remote_content_size_bytes: int
+    url_fetch_timeout_seconds: int
+    url_fetch_max_redirects: int
+    login_rate_limit: int
+    login_rate_window_seconds: int
+    chat_rate_limit: int
+    api_rate_limit: int
+    rate_limit_window_seconds: int
+    rate_limit_fail_open: bool
+    worker_recovery_interval_seconds: int
+    ingest_running_stale_seconds: int
     redis_url: str | None
     upload_storage_dir: str
     default_org_name: str
@@ -104,6 +145,20 @@ class AppSettings:
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             jwt_secret=os.getenv("JWT_SECRET", "change-me-in-production"),
             jwt_ttl_minutes=_as_int("JWT_TTL_MINUTES", 1440),
+            cors_allowed_origins=_as_csv("CORS_ALLOWED_ORIGINS"),
+            trusted_proxy_cidrs=_as_csv("TRUSTED_PROXY_CIDRS"),
+            max_upload_size_bytes=_as_int("MAX_UPLOAD_SIZE_BYTES", 50 * 1024 * 1024),
+            max_remote_content_size_bytes=_as_int("MAX_REMOTE_CONTENT_SIZE_BYTES", 8 * 1024 * 1024),
+            url_fetch_timeout_seconds=_as_int("URL_FETCH_TIMEOUT_SECONDS", 15),
+            url_fetch_max_redirects=_as_int("URL_FETCH_MAX_REDIRECTS", 3),
+            login_rate_limit=_as_int("LOGIN_RATE_LIMIT", 8),
+            login_rate_window_seconds=_as_int("LOGIN_RATE_WINDOW_SECONDS", 900),
+            chat_rate_limit=_as_int("CHAT_RATE_LIMIT", 30),
+            api_rate_limit=_as_int("API_RATE_LIMIT", 120),
+            rate_limit_window_seconds=_as_int("RATE_LIMIT_WINDOW_SECONDS", 60),
+            rate_limit_fail_open=_as_bool("RATE_LIMIT_FAIL_OPEN", False),
+            worker_recovery_interval_seconds=_as_int("WORKER_RECOVERY_INTERVAL_SECONDS", 30),
+            ingest_running_stale_seconds=_as_int("INGEST_RUNNING_STALE_SECONDS", 1800),
             redis_url=os.getenv("REDIS_URL"),
             upload_storage_dir=os.getenv("UPLOAD_STORAGE_DIR", "storage/uploads"),
             default_org_name=os.getenv("DEFAULT_ORG_NAME", "Default Organization"),
@@ -171,12 +226,46 @@ class AppSettings:
             errors.append("REDIS_URL is required for ingest job queue")
         if not self.jwt_secret:
             errors.append("JWT_SECRET is required")
+        if self.app_env.lower() == "production" and self.jwt_secret in {
+            "change-me-in-production",
+            "replace-with-a-long-random-secret",
+        }:
+            errors.append("JWT_SECRET must be changed in production")
         if self.jwt_ttl_minutes <= 0:
             errors.append("JWT_TTL_MINUTES must be greater than 0")
+        for origin in self.cors_allowed_origins:
+            if not is_valid_cors_origin(origin):
+                errors.append(f"CORS_ALLOWED_ORIGINS contains an invalid origin: {origin}")
+        for cidr in self.trusted_proxy_cidrs:
+            try:
+                ip_network(cidr, strict=False)
+            except ValueError:
+                errors.append(f"TRUSTED_PROXY_CIDRS contains an invalid CIDR: {cidr}")
+        if self.max_upload_size_bytes <= 0:
+            errors.append("MAX_UPLOAD_SIZE_BYTES must be greater than 0")
+        if self.max_remote_content_size_bytes <= 0:
+            errors.append("MAX_REMOTE_CONTENT_SIZE_BYTES must be greater than 0")
+        if self.url_fetch_timeout_seconds <= 0:
+            errors.append("URL_FETCH_TIMEOUT_SECONDS must be greater than 0")
+        if self.url_fetch_max_redirects < 0:
+            errors.append("URL_FETCH_MAX_REDIRECTS must be greater than or equal to 0")
+        if self.login_rate_limit <= 0 or self.chat_rate_limit <= 0 or self.api_rate_limit <= 0:
+            errors.append("Rate limits must be greater than 0")
+        if self.login_rate_window_seconds <= 0 or self.rate_limit_window_seconds <= 0:
+            errors.append("Rate limit windows must be greater than 0")
+        if self.worker_recovery_interval_seconds <= 0:
+            errors.append("WORKER_RECOVERY_INTERVAL_SECONDS must be greater than 0")
+        if self.ingest_running_stale_seconds <= 0:
+            errors.append("INGEST_RUNNING_STALE_SECONDS must be greater than 0")
         if not self.default_admin_email:
             errors.append("DEFAULT_ADMIN_EMAIL is required")
         if not self.default_admin_password:
             errors.append("DEFAULT_ADMIN_PASSWORD is required")
+        if self.app_env.lower() == "production" and self.default_admin_password in {
+            "admin123456",
+            "change-me-admin-password",
+        }:
+            errors.append("DEFAULT_ADMIN_PASSWORD must be changed in production")
         if self.embedding_dimension <= 0:
             errors.append("EMBEDDING_DIMENSION must be greater than 0")
         if self.rag_top_k <= 0:

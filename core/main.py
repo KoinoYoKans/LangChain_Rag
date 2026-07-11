@@ -6,6 +6,7 @@ import io
 import ipaddress
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -21,7 +23,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
 from config.model import build_chat_model
-from config.settings import AppSettings
+from config.settings import AppSettings, is_valid_cors_origin
 from core.auth import CurrentUser, create_access_token, require_current_user
 from core.api_key_store import (
     ApiKey,
@@ -133,9 +135,12 @@ from core.quality_issue_store import (
     update_quality_issue,
 )
 from core.ingestion import _extract_title, _fetch_url, _slugify
+from core.ingestion import validate_public_http_url
 from core.job_queue import enqueue_ingest_job, get_ingest_queue_length, get_worker_heartbeat
+from core.rate_limit import enforce_rate_limit
 from core.rerank import RerankedDocument, Reranker, build_reranker
 from core.retrieval import hybrid_search
+from core.upload_safety import read_upload_bytes, sanitize_filename, validate_document_bytes
 from core.vector_store import (
     add_documents,
     build_vector_store,
@@ -154,7 +159,7 @@ DEFAULT_OPENAPI_REWRITE_TOKEN_RESERVE = 128
 
 class ChatRequest(BaseModel):
     knowledge_base_id: str = Field(min_length=1)
-    message: str = Field(min_length=1)
+    message: str = Field(min_length=1, max_length=12_000)
     conversation_id: str | None = None
     top_k: int | None = Field(default=None, ge=1, le=50)
     rerank_top_n: int | None = Field(default=None, ge=0, le=50)
@@ -205,8 +210,8 @@ class FeedbackRequest(BaseModel):
     conversation_id: str = Field(min_length=1)
     assistant_message_id: str = Field(min_length=1)
     rating: str = Field(pattern="^(up|down)$")
-    question: str = Field(min_length=1)
-    answer: str = Field(min_length=1)
+    question: str = Field(min_length=1, max_length=12_000)
+    answer: str = Field(min_length=1, max_length=24_000)
     reason: str | None = Field(default=None, max_length=120)
     comment: str | None = Field(default=None, max_length=1000)
     sources_snapshot: list[dict[str, Any]] = Field(default_factory=list)
@@ -435,8 +440,8 @@ class ChatMessageListResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: str = Field(min_length=3)
-    password: str = Field(min_length=1)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=512)
 
 
 class TokenResponse(BaseModel):
@@ -459,22 +464,22 @@ class DepartmentResponse(BaseModel):
 
 
 class UserCreateRequest(BaseModel):
-    email: str = Field(min_length=3)
-    display_name: str = Field(min_length=1)
-    password: str = Field(min_length=8)
+    email: str = Field(min_length=3, max_length=254)
+    display_name: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=12, max_length=512)
     role: str = Field(default="member", pattern="^(admin|manager|member)$")
     department_id: str | None = None
 
 
 class UserUpdateRequest(BaseModel):
-    display_name: str = Field(min_length=1)
+    display_name: str = Field(min_length=1, max_length=120)
     role: str = Field(default="member", pattern="^(admin|manager|member)$")
     department_id: str | None = None
     is_active: bool = True
 
 
 class PasswordResetRequest(BaseModel):
-    password: str = Field(min_length=8)
+    password: str = Field(min_length=12, max_length=512)
 
 
 class UserResponse(BaseModel):
@@ -490,8 +495,8 @@ class UserResponse(BaseModel):
 
 
 class KnowledgeBaseCreateRequest(BaseModel):
-    name: str = Field(min_length=1)
-    description: str | None = None
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2_000)
     visibility: str = Field(default="department", pattern="^(private|department|org)$")
     department_ids: list[str] = Field(default_factory=list)
     retrieval_top_k: int | None = Field(default=None, ge=1, le=50)
@@ -501,8 +506,8 @@ class KnowledgeBaseCreateRequest(BaseModel):
 
 
 class KnowledgeBaseUpdateRequest(BaseModel):
-    name: str = Field(min_length=1)
-    description: str | None = None
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2_000)
     visibility: str = Field(default="department", pattern="^(private|department|org)$")
     department_ids: list[str] = Field(default_factory=list)
     retrieval_top_k: int | None = Field(default=None, ge=1, le=50)
@@ -586,8 +591,8 @@ class KnowledgeBaseGrantListResponse(BaseModel):
 
 
 class UrlIngestRequest(BaseModel):
-    url: str = Field(min_length=8)
-    filename: str | None = None
+    url: str = Field(min_length=8, max_length=2_048)
+    filename: str | None = Field(default=None, max_length=180)
 
 
 class UrlBatchPlanRequest(BaseModel):
@@ -744,7 +749,7 @@ class DocumentPreviewResponse(BaseModel):
 
 
 class RetrievalRequest(BaseModel):
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=4_000)
     top_k: int = Field(default=8, ge=1, le=50)
 
 
@@ -753,13 +758,13 @@ class RetrievalResponse(BaseModel):
 
 
 class OpenAIChatMessage(BaseModel):
-    role: str
-    content: str
+    role: str = Field(pattern="^(system|user|assistant)$")
+    content: str = Field(min_length=1, max_length=12_000)
 
 
 class OpenAIChatCompletionRequest(BaseModel):
-    model: str | None = None
-    messages: list[OpenAIChatMessage] = Field(min_length=1)
+    model: str | None = Field(default=None, max_length=128)
+    messages: list[OpenAIChatMessage] = Field(min_length=1, max_length=30)
     temperature: float | None = None
     max_tokens: int | None = Field(default=None, ge=1, le=16000)
     stream: bool = False
@@ -790,16 +795,62 @@ class RagState:
         )
 
 
+@asynccontextmanager
+async def application_lifespan(app: FastAPI):
+    app.state.rag = await initialize_state_async()
+    yield
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="LangChain RAG Agent",
         version="0.1.0",
         description="FastAPI RAG service with OpenAI-compatible chat, local embeddings/rerank, and pgvector.",
+        lifespan=application_lifespan,
     )
 
-    @app.on_event("startup")
-    async def startup() -> None:
-        app.state.rag = await initialize_state_async()
+    # Browser clients are optional. When enabled, only explicitly configured origins
+    # can send bearer-token requests to the API.
+    cors_origins = AppSettings.load().cors_allowed_origins
+    if cors_origins and all(is_valid_cors_origin(origin) for origin in cors_origins):
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(cors_origins),
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
+            expose_headers=["X-Request-ID"],
+            max_age=600,
+        )
+
+    @app.middleware("http")
+    async def add_security_headers_and_request_id(request: Request, call_next: Any) -> Response:
+        state = get_state(app)
+        request_id = request.headers.get("x-request-id", "")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{8,128}", request_id):
+            request_id = str(uuid4())
+        request.state.request_id = request_id
+
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > state.settings.max_upload_size_bytes:
+                    response = Response(
+                        content='{"detail":"Request body exceeds configured size limit"}',
+                        status_code=413,
+                        media_type="application/json",
+                    )
+                    return _set_security_headers(response, request_id, request.url.path)
+            except ValueError:
+                response = Response(
+                    content='{"detail":"Invalid Content-Length header"}',
+                    status_code=400,
+                    media_type="application/json",
+                )
+                return _set_security_headers(response, request_id, request.url.path)
+
+        response = await call_next(request)
+        return _set_security_headers(response, request_id, request.url.path)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -815,35 +866,35 @@ def create_app() -> FastAPI:
         errors = list(state.init_errors or [])
         if database_error:
             errors.append(f"database check failed: {database_error}")
-        return {
+        response: dict[str, Any] = {
             "status": "ok" if not errors else "error",
             "ready": state.ready and database_ok,
-            "errors": errors,
-            "config": {
-                "app_env": state.settings.app_env,
-                "chat_model": state.settings.openai_model,
-                "embedding_provider": state.settings.embedding_provider,
-                "embedding_dimension": state.settings.embedding_dimension,
-                "embedding_model": state.settings.local_embedding_model_path,
-                "rerank_provider": state.settings.rerank_provider,
-                "rerank_model": state.settings.local_rerank_model_path,
-                "pgvector_table": state.settings.pgvector_table,
-                "rag_file_table": state.settings.rag_file_table,
-                "rag_chunk_table": state.settings.rag_chunk_table,
-                "rag_conversation_table": state.settings.rag_conversation_table,
-                "rag_message_table": state.settings.rag_message_table,
-                "rag_top_k": state.settings.rag_top_k,
-                "rerank_top_n": state.settings.rerank_top_n,
-                "chat_history_limit": state.settings.chat_history_limit,
-                "openai_timeout_seconds": state.settings.openai_timeout_seconds,
-                "retrieval_timeout_seconds": state.settings.retrieval_timeout_seconds,
-                "rerank_timeout_seconds": state.settings.rerank_timeout_seconds,
-            },
         }
+        if state.settings.app_env.lower() != "production" and errors:
+            response["errors"] = errors
+        return response
+
+    @app.get("/health/ready")
+    def readiness() -> dict[str, Any]:
+        state = get_state(app)
+        try:
+            check_database(state.settings)
+        except Exception:  # noqa: BLE001
+            raise HTTPException(status_code=503, detail="Service dependencies are not ready") from None
+        if not state.ready:
+            raise HTTPException(status_code=503, detail="RAG service is not ready")
+        return {"status": "ok", "ready": True}
 
     @app.post("/auth/login", response_model=TokenResponse)
     async def login(request: Request, payload: LoginRequest) -> TokenResponse:
         settings = get_state(app).settings
+        await enforce_rate_limit(
+            settings,
+            scope="login",
+            identity=f"{client_ip(request)}:{payload.email.strip().lower()}",
+            limit=settings.login_rate_limit,
+            window_seconds=settings.login_rate_window_seconds,
+        )
         user = await authenticate_user(settings, payload.email, payload.password)
         if user is None:
             raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -1685,32 +1736,43 @@ def create_app() -> FastAPI:
             action="document.ingest_requested.denied",
             write=True,
         )
-        filename = file.filename or "uploaded"
+        filename = sanitize_filename(file.filename or "uploaded")
         if not any(filename.lower().endswith(extension) for extension in SUPPORTED_EXTENSIONS):
             supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
             raise HTTPException(status_code=400, detail=f"Unsupported document type. Supported: {supported}")
-        data = await file.read()
-        storage_dir = Path(state.settings.upload_storage_dir)
+        data = await read_upload_bytes(file, state.settings.max_upload_size_bytes)
+        validate_document_bytes(filename, data, state.settings.max_upload_size_bytes)
+        storage_dir = Path(state.settings.upload_storage_dir).resolve()
         storage_dir.mkdir(parents=True, exist_ok=True)
         job_file_id = str(uuid4())
-        safe_name = filename.replace("/", "_").replace("\\", "_")
-        storage_path = storage_dir / f"{job_file_id}_{safe_name}"
-        storage_path.write_bytes(data)
-        job = await create_ingest_job(
-            state.settings,
-            org_id=current_user.org_id,
-            knowledge_base_id=knowledge_base_id,
-            created_by_user_id=current_user.id,
-            source_type="file",
-            source_uri=str(storage_path),
-            filename=filename,
-            payload={
-                "path": str(storage_path),
-                "content_type": file.content_type or "application/octet-stream",
-                "file_size": len(data),
-            },
-        )
-        enqueue_ingest_job(state.settings, job.id)
+        storage_path = storage_dir / f"{job_file_id}_{filename}"
+        try:
+            with storage_path.open("xb") as destination:
+                destination.write(data)
+            storage_path.chmod(0o600)
+            job = await create_ingest_job(
+                state.settings,
+                org_id=current_user.org_id,
+                knowledge_base_id=knowledge_base_id,
+                created_by_user_id=current_user.id,
+                source_type="file",
+                source_uri=str(storage_path),
+                filename=filename,
+                payload={
+                    "path": str(storage_path),
+                    "content_type": file.content_type or "application/octet-stream",
+                    "file_size": len(data),
+                },
+            )
+        except Exception:
+            storage_path.unlink(missing_ok=True)
+            raise
+        queue_delivery = "queued"
+        try:
+            enqueue_ingest_job(state.settings, job.id)
+        except Exception:  # noqa: BLE001
+            # The worker polls pending jobs from Postgres as a durable fallback.
+            queue_delivery = "deferred"
         await add_audit_log(
             state.settings,
             org_id=current_user.org_id,
@@ -1719,7 +1781,7 @@ def create_app() -> FastAPI:
             action="document.ingest_requested",
             target_type="ingest_job",
             target_id=job.id,
-            metadata={"knowledge_base_id": knowledge_base_id, "filename": filename},
+            metadata={"knowledge_base_id": knowledge_base_id, "filename": filename, "queue_delivery": queue_delivery},
             **audit_context(http_request),
         )
         return ingest_job_response(job)
@@ -1740,15 +1802,19 @@ def create_app() -> FastAPI:
             action="url.ingest_requested.denied",
             write=True,
         )
+        try:
+            source_url = validate_public_http_url(request.url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         job = await create_ingest_job(
             state.settings,
             org_id=current_user.org_id,
             knowledge_base_id=knowledge_base_id,
             created_by_user_id=current_user.id,
             source_type="url",
-            source_uri=request.url,
+            source_uri=source_url,
             filename=request.filename,
-            payload={"url": request.url},
+            payload={"url": source_url},
         )
         enqueue_ingest_job(state.settings, job.id)
         await add_audit_log(
@@ -1759,7 +1825,7 @@ def create_app() -> FastAPI:
             action="url.ingest_requested",
             target_type="ingest_job",
             target_id=job.id,
-            metadata={"knowledge_base_id": knowledge_base_id, "url": request.url},
+            metadata={"knowledge_base_id": knowledge_base_id, "url": source_url},
             **audit_context(http_request),
         )
         return ingest_job_response(job)
@@ -2758,6 +2824,13 @@ def create_app() -> FastAPI:
         current_user: CurrentUser = Depends(require_current_user),
     ) -> ChatResponse:
         state = require_ready(app)
+        await enforce_rate_limit(
+            state.settings,
+            scope="chat",
+            identity=current_user.id,
+            limit=state.settings.chat_rate_limit,
+            window_seconds=state.settings.rate_limit_window_seconds,
+        )
         kb = await require_kb_access_or_audit(
             state.settings,
             request=http_request,
@@ -3425,6 +3498,13 @@ def create_app() -> FastAPI:
             request=http_request,
             action="openapi.retrieval.auth",
         )
+        await enforce_rate_limit(
+            state.settings,
+            scope="api",
+            identity=api_key.id,
+            limit=state.settings.api_rate_limit,
+            window_seconds=state.settings.rate_limit_window_seconds,
+        )
         if api_key.knowledge_base_id != knowledge_base_id:
             await add_audit_log(
                 state.settings,
@@ -3517,6 +3597,13 @@ def create_app() -> FastAPI:
             x_api_key,
             request=http_request,
             action="openapi.chat_completion.auth",
+        )
+        await enforce_rate_limit(
+            state.settings,
+            scope="api",
+            identity=api_key.id,
+            limit=state.settings.api_rate_limit,
+            window_seconds=state.settings.rate_limit_window_seconds,
         )
         started_at = time.perf_counter()
         request_context = audit_context(http_request)
@@ -3703,6 +3790,8 @@ def initialize_state() -> RagState:
     settings = AppSettings.load()
     errors = settings.validation_errors()
     state = RagState(settings=settings, init_errors=errors)
+    if errors:
+        return state
     if settings.postgres_dsn:
         try:
             initialize_database(settings)
@@ -3711,8 +3800,6 @@ def initialize_state() -> RagState:
             asyncio.run(bootstrap_default_org(settings))
         except Exception as exc:  # noqa: BLE001
             state.init_errors = [*(state.init_errors or []), f"enterprise bootstrap failed: {exc}"]
-    if errors:
-        return state
     try:
         state.chat_model = build_chat_model(settings)
         state.embeddings = build_embeddings(settings)
@@ -3729,14 +3816,14 @@ async def initialize_state_async() -> RagState:
     settings = AppSettings.load()
     errors = settings.validation_errors()
     state = RagState(settings=settings, init_errors=errors)
+    if errors:
+        return state
     if settings.postgres_dsn:
         try:
             await initialize_database_async(settings)
             await bootstrap_default_org(settings)
         except Exception as exc:  # noqa: BLE001
             state.init_errors = [*(state.init_errors or []), f"enterprise bootstrap failed: {exc}"]
-    if errors:
-        return state
     try:
         state.chat_model = build_chat_model(settings)
         state.embeddings = build_embeddings(settings)
@@ -4596,10 +4683,45 @@ def require_manager(user: CurrentUser) -> None:
 
 def audit_context(request: Request) -> dict[str, Any]:
     return {
-        "ip_address": request.client.host if request.client else None,
+        "ip_address": client_ip(request),
         "user_agent": request.headers.get("user-agent"),
-        "request_id": request.headers.get("x-request-id") or str(uuid4()),
+        "request_id": getattr(request.state, "request_id", None) or str(uuid4()),
     }
+
+
+def client_ip(request: Request) -> str:
+    """Use forwarded client IP only from an explicitly trusted reverse proxy network."""
+    peer_ip = request.client.host if request.client else "unknown"
+    state = getattr(request.app.state, "rag", None)
+    trusted_proxy_cidrs = getattr(getattr(state, "settings", None), "trusted_proxy_cidrs", ())
+    return resolve_client_ip(peer_ip, request.headers.get("x-forwarded-for"), trusted_proxy_cidrs)
+
+
+def resolve_client_ip(peer_ip: str, forwarded_for: str | None, trusted_proxy_cidrs: tuple[str, ...]) -> str:
+    try:
+        peer_address = ipaddress.ip_address(peer_ip)
+        trusted_networks = [ipaddress.ip_network(cidr, strict=False) for cidr in trusted_proxy_cidrs]
+    except ValueError:
+        return peer_ip
+    if not forwarded_for or not any(peer_address in network for network in trusted_networks):
+        return peer_ip
+    forwarded_ip = forwarded_for.split(",", 1)[0].strip()
+    try:
+        ipaddress.ip_address(forwarded_ip)
+    except ValueError:
+        return peer_ip
+    return forwarded_ip
+
+
+def _set_security_headers(response: Response, request_id: str, path: str) -> Response:
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if path.startswith(("/auth", "/v1", "/chat", "/knowledge-bases", "/documents", "/users", "/api-keys")):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 async def require_valid_api_key(
@@ -5144,8 +5266,9 @@ async def plan_single_url_import(
     knowledge_base_id: str,
     skip_duplicates: bool,
 ) -> UrlImportPlanItem:
-    parsed_url = urlsplit(url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+    try:
+        normalized_url = validate_public_http_url(url)
+    except ValueError as exc:
         return UrlImportPlanItem(
             index=index,
             client_item_id=client_item_id,
@@ -5153,23 +5276,18 @@ async def plan_single_url_import(
             status="invalid_url",
             severity="blocked",
             can_enqueue=False,
-            reason_code="invalid_url",
-            reason="Only http(s) URLs are supported",
-        )
-    if not is_public_http_url(parsed_url.hostname):
-        return UrlImportPlanItem(
-            index=index,
-            client_item_id=client_item_id,
-            url=url,
-            status="invalid_url",
-            severity="blocked",
-            can_enqueue=False,
-            reason_code="private_or_local_host",
-            reason="Private, local, or reserved hosts are not allowed",
+            reason_code="invalid_or_private_url",
+            reason=str(exc),
         )
     try:
-        html = await asyncio.to_thread(_fetch_url, url, 10)
-        parsed = parse_html(_slugify(_extract_title(html) or url) + ".html", html)
+        html = await asyncio.to_thread(
+            _fetch_url,
+            normalized_url,
+            settings.url_fetch_timeout_seconds,
+            settings.max_remote_content_size_bytes,
+            settings.url_fetch_max_redirects,
+        )
+        parsed = parse_html(_slugify(_extract_title(html) or normalized_url) + ".html", html)
         content = parsed.text.strip()
         if not content:
             return UrlImportPlanItem(
@@ -5190,7 +5308,7 @@ async def plan_single_url_import(
             knowledge_base_id=knowledge_base_id,
         )
         title = _extract_title(html)
-        filename = f"{_slugify(title or url)}.html"
+        filename = f"{_slugify(title or normalized_url)}.html"
         _, chunks = build_chunks_from_text(
             filename=filename,
             content_type=parsed.content_type,
@@ -5201,13 +5319,13 @@ async def plan_single_url_import(
             user_id=user_id,
             knowledge_base_id=knowledge_base_id,
             source_type="url",
-            source_uri=url,
+            source_uri=normalized_url,
         )
         if duplicate:
             return UrlImportPlanItem(
                 index=index,
                 client_item_id=client_item_id,
-                url=url,
+                url=normalized_url,
                 filename=filename,
                 content_type=parsed.content_type,
                 file_size=len(html.encode("utf-8")),
@@ -5224,7 +5342,7 @@ async def plan_single_url_import(
         return UrlImportPlanItem(
             index=index,
             client_item_id=client_item_id,
-            url=url,
+            url=normalized_url,
             filename=filename,
             content_type=parsed.content_type,
             file_size=len(html.encode("utf-8")),

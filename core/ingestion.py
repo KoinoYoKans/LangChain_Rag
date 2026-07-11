@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
+import ipaddress
 import re
+import socket
 from pathlib import Path
 from typing import Any
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from uuid import uuid4
 
 from config.settings import AppSettings
@@ -45,7 +48,7 @@ async def process_ingest_job(settings: AppSettings, job_id: str) -> None:
     vector_store = None
     ids: list[str] = []
     try:
-        source = _load_job_source(job.payload, job.source_type, job.source_uri, job.filename)
+        source = _load_job_source(settings, job.payload, job.source_type, job.source_uri, job.filename)
         parsed = source["parsed"]
         content_sha256 = hash_text(parsed.text)
         planned_content_sha256 = str(job.payload.get("planned_content_sha256") or "")
@@ -212,7 +215,13 @@ async def _raise_if_cancelled(settings: AppSettings, job_id: str) -> None:
         raise IngestJobCancelledError(f"Ingest job has been cancelled: {job_id}")
 
 
-def _load_job_source(payload: dict[str, Any], source_type: str, source_uri: str | None, filename: str | None) -> dict[str, Any]:
+def _load_job_source(
+    settings: AppSettings,
+    payload: dict[str, Any],
+    source_type: str,
+    source_uri: str | None,
+    filename: str | None,
+) -> dict[str, Any]:
     if source_type == "file":
         path = Path(str(payload["path"]))
         data = path.read_bytes()
@@ -228,7 +237,12 @@ def _load_job_source(payload: dict[str, Any], source_type: str, source_uri: str 
     if source_type == "url":
         if not source_uri:
             raise ValueError("URL ingest job requires source_uri")
-        html = _fetch_url(source_uri)
+        html = _fetch_url(
+            source_uri,
+            timeout_seconds=settings.url_fetch_timeout_seconds,
+            max_bytes=settings.max_remote_content_size_bytes,
+            max_redirects=settings.url_fetch_max_redirects,
+        )
         title = _extract_title(html)
         resolved_filename = filename or f"{_slugify(title or source_uri)}.html"
         parsed = parse_html(resolved_filename, html)
@@ -243,11 +257,147 @@ def _load_job_source(payload: dict[str, Any], source_type: str, source_uri: str 
     raise ValueError(f"Unsupported ingest source_type: {source_type}")
 
 
-def _fetch_url(url: str, timeout_seconds: int = 20) -> str:
-    request = Request(url, headers={"User-Agent": "LangChain-RagBot/1.0"})
-    with urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310
-        charset = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(charset, errors="ignore")
+def validate_public_http_url(url: str) -> str:
+    """Validate URL syntax and ensure its current DNS answers are public."""
+    parsed = urlsplit(url.strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Only absolute http(s) URLs are allowed")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs with embedded credentials are not allowed")
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    if parsed.port not in {None, default_port}:
+        raise ValueError("URL port must match its http(s) scheme")
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
+        raise ValueError("Local network URLs are not allowed")
+    _resolve_public_host(hostname, parsed.port or default_port)
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path or "/", parsed.query, ""))
+
+
+def _resolve_public_host(hostname: str, port: int) -> list[str]:
+    """Resolve a host once and return only verified public IPs for a pinned connection."""
+    try:
+        addresses = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError("URL host could not be resolved") from exc
+    resolved: list[str] = []
+    for address in addresses:
+        host = str(address[4][0]).split("%")[0]
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError("URL host resolved to an invalid address") from exc
+        if not ip.is_global:
+            raise ValueError("Private, loopback, or reserved network URLs are not allowed")
+        if host not in resolved:
+            resolved.append(host)
+    if not resolved:
+        raise ValueError("URL host could not be resolved")
+    return resolved
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, port: int, resolved_ip: str, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self.resolved_ip = resolved_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self.resolved_ip, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, resolved_ip: str, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self.resolved_ip = resolved_ip
+
+    def connect(self) -> None:
+        raw_socket = socket.create_connection((self.resolved_ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+
+
+def _fetch_url(
+    url: str,
+    timeout_seconds: int = 15,
+    max_bytes: int = 8 * 1024 * 1024,
+    max_redirects: int = 3,
+) -> str:
+    """Fetch HTML with SSRF, DNS rebinding, redirect, MIME, timeout, and size controls."""
+    current_url = validate_public_http_url(url)
+    for redirect_count in range(max_redirects + 1):
+        parsed = urlsplit(current_url)
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("URL host could not be resolved")
+        scheme = parsed.scheme.lower()
+        port = parsed.port or (443 if scheme == "https" else 80)
+        addresses = _resolve_public_host(hostname, port)
+        request_path = parsed.path or "/"
+        if parsed.query:
+            request_path = f"{request_path}?{parsed.query}"
+        response: http.client.HTTPResponse | None = None
+        connection: http.client.HTTPConnection | None = None
+        last_error: OSError | None = None
+        for address in addresses:
+            connection = (
+                _PinnedHTTPSConnection(hostname, port, address, timeout_seconds)
+                if scheme == "https"
+                else _PinnedHTTPConnection(hostname, port, address, timeout_seconds)
+            )
+            try:
+                connection.request(
+                    "GET",
+                    request_path,
+                    headers={
+                        "User-Agent": "Enterprise-RAG-Importer/1.0",
+                        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.8",
+                    },
+                )
+                response = connection.getresponse()
+                break
+            except (OSError, http.client.HTTPException) as exc:
+                connection.close()
+                connection = None
+                last_error = exc
+        if response is None or connection is None:
+            raise ValueError("URL could not be fetched") from last_error
+        try:
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.getheader("Location")
+                response.read()
+                if redirect_count >= max_redirects:
+                    raise ValueError("URL exceeded the maximum redirect count")
+                if not location:
+                    raise ValueError("URL redirect did not include a Location header")
+                current_url = validate_public_http_url(urljoin(current_url, location))
+                continue
+            if response.status < 200 or response.status >= 300:
+                raise ValueError(f"URL returned HTTP {response.status}")
+            content_type = (response.headers.get_content_type() or "").lower()
+            if content_type not in {"text/html", "application/xhtml+xml", "text/plain"}:
+                raise ValueError(f"URL content type is not supported: {content_type or 'unknown'}")
+            content_length = response.getheader("Content-Length")
+            if content_length and int(content_length) > max_bytes:
+                raise ValueError(f"URL response exceeds the {max_bytes} byte limit")
+            parts: list[bytes] = []
+            total = 0
+            while True:
+                chunk = response.read(min(64 * 1024, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"URL response exceeds the {max_bytes} byte limit")
+                parts.append(chunk)
+            charset = response.headers.get_content_charset() or "utf-8"
+            try:
+                return b"".join(parts).decode(charset, errors="strict")
+            except LookupError:
+                return b"".join(parts).decode("utf-8", errors="replace")
+            except UnicodeDecodeError:
+                return b"".join(parts).decode(charset, errors="replace")
+        finally:
+            connection.close()
+    raise ValueError("URL exceeded the maximum redirect count")
 
 
 def _extract_title(html: str) -> str:

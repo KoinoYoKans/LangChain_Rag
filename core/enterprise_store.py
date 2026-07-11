@@ -58,6 +58,7 @@ class EnterpriseUser:
     is_active: bool
     last_login_at: datetime | None
     created_at: datetime
+    updated_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -180,7 +181,12 @@ async def authenticate_user(settings: AppSettings, email: str, password: str) ->
         user = await session.scalar(select(UserModel).where(UserModel.email == email, UserModel.is_active.is_(True)))
         if user is None or not verify_password(password, user.password_hash):
             return None
-        await session.execute(update(UserModel).where(UserModel.id == user.id).values(last_login_at=func.now()))
+        await session.execute(
+            update(UserModel)
+            .where(UserModel.id == user.id)
+            # A successful login is telemetry, not a security-identity change.
+            .values(last_login_at=func.now(), updated_at=UserModel.updated_at)
+        )
         await session.commit()
         await session.refresh(user)
         return _user_to_dataclass(user)
@@ -1117,6 +1123,7 @@ def _user_to_dataclass(model: UserModel) -> EnterpriseUser:
         is_active=bool(model.is_active),
         last_login_at=model.last_login_at,
         created_at=model.created_at,
+        updated_at=model.updated_at,
     )
 
 

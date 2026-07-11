@@ -1,27 +1,30 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   ApiOutlined,
+  ArrowRightOutlined,
   AuditOutlined,
   BankOutlined,
   CloudUploadOutlined,
+  DashboardOutlined,
+  DatabaseOutlined,
   DeleteOutlined,
   DislikeOutlined,
   EditOutlined,
   EyeOutlined,
   FileSearchOutlined,
   HistoryOutlined,
-  KeyOutlined,
   LikeOutlined,
   MessageOutlined,
   ReloadOutlined,
+  SafetyCertificateOutlined,
   TeamOutlined,
+  WarningOutlined,
 } from "@ant-design/icons";
 import {
   App as AntApp,
   Button,
   ConfigProvider,
-  DatePicker,
   Descriptions,
   Drawer,
   Flex,
@@ -50,6 +53,7 @@ import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 const queryClient = new QueryClient();
+const ApiKeyWorkspace = lazy(() => import("./workspaces/ApiKeyWorkspace"));
 
 function App() {
   return (
@@ -57,7 +61,7 @@ function App() {
       theme={{
         algorithm: theme.defaultAlgorithm,
         token: {
-          colorPrimary: "#2563eb",
+          colorPrimary: "#0f766e",
           borderRadius: 6,
           fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
         },
@@ -75,7 +79,7 @@ function App() {
 function Shell() {
   const [token, setToken] = useState(localStorage.getItem("rag_token") || "");
   const [user, setUser] = useState(JSON.parse(localStorage.getItem("rag_user") || "null"));
-  const [page, setPage] = useState("knowledge");
+  const [page, setPage] = useState("overview");
   const api = useMemo(() => buildApi(token), [token]);
 
   useEffect(() => {
@@ -100,11 +104,16 @@ function Shell() {
   if (!token) return <Login onLogin={onLogin} />;
 
   const menuItems = [
+    { key: "overview", icon: <DashboardOutlined />, label: "运营总览" },
     { key: "knowledge", icon: <BankOutlined />, label: "知识库" },
     { key: "chat", icon: <MessageOutlined />, label: "问答" },
-    { key: "users", icon: <TeamOutlined />, label: "组织用户" },
-    { key: "api", icon: <ApiOutlined />, label: "开放接口" },
-    { key: "audit", icon: <AuditOutlined />, label: "审计" },
+    ...(user?.role === "admin" || user?.role === "manager"
+      ? [
+          { key: "users", icon: <TeamOutlined />, label: "组织用户" },
+          { key: "api", icon: <ApiOutlined />, label: "开放接口" },
+          { key: "audit", icon: <AuditOutlined />, label: "审计与质量" },
+        ]
+      : []),
   ];
 
   return (
@@ -121,13 +130,117 @@ function Shell() {
         </div>
       </Layout.Sider>
       <Layout.Content className="workspace">
+        {page === "overview" && <OverviewWorkspace api={api} user={user} onNavigate={setPage} />}
         {page === "knowledge" && <KnowledgeWorkspace api={api} user={user} />}
         {page === "chat" && <ChatWorkspace api={api} />}
         {page === "users" && <UsersWorkspace api={api} user={user} />}
-        {page === "api" && <ApiKeyWorkspace api={api} />}
+        {page === "api" && <Suspense fallback={<WorkspaceLoading />}><ApiKeyWorkspace api={api} /></Suspense>}
         {page === "audit" && <AuditWorkspace api={api} user={user} />}
       </Layout.Content>
     </Layout>
+  );
+}
+
+function OverviewWorkspace({ api, user, onNavigate }) {
+  const knowledgeBases = useQuery({
+    queryKey: ["overview-kbs"],
+    queryFn: async () => (await api.get("/knowledge-bases")).data.items || [],
+  });
+  const serviceHealth = useQuery({
+    queryKey: ["service-health"],
+    queryFn: async () => (await api.get("/health")).data,
+    refetchInterval: 30_000,
+    retry: false,
+  });
+  const items = knowledgeBases.data || [];
+  const accessible = items.filter((item) => item.can_read);
+  const writable = accessible.filter((item) => item.can_write);
+  const documents = accessible.reduce((total, item) => total + Number(item.file_count || 0), 0);
+  const completed = accessible.reduce((total, item) => total + Number(item.completed_file_count || 0), 0);
+  const failedJobs = accessible.reduce((total, item) => total + Number(item.failed_job_count || 0), 0);
+  const attention = accessible.filter((item) => Number(item.failed_job_count || 0) > 0 || (Number(item.file_count || 0) > 0 && Number(item.completed_file_count || 0) === 0));
+  const healthState = serviceHealth.isError ? "unknown" : serviceHealth.data?.ready ? "ready" : "degraded";
+  const healthLabel = healthState === "ready" ? "服务就绪" : healthState === "degraded" ? "依赖检查中" : "状态未知";
+
+  return (
+    <section className="overview-page">
+      <header className="overview-header">
+        <div>
+          <span className="eyebrow">{user?.role === "admin" ? "管理视图" : user?.role === "manager" ? "运营视图" : "成员视图"}</span>
+          <Typography.Title level={2}>运营总览</Typography.Title>
+          <Typography.Text type="secondary">知识资产、处理状态与待关注事项。</Typography.Text>
+        </div>
+        <Space wrap>
+          <span className={`service-status ${healthState}`} title="API、数据库与检索模型的当前就绪状态">
+            <SafetyCertificateOutlined /> {healthLabel}
+          </span>
+          <Button icon={<MessageOutlined />} onClick={() => onNavigate("chat")}>进入问答</Button>
+          {writable.length > 0 && <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => onNavigate("knowledge")}>管理知识库</Button>}
+        </Space>
+      </header>
+
+      <div className="metric-grid" aria-label="知识库运营指标">
+        <MetricCard icon={<DatabaseOutlined />} label="可访问知识库" value={accessible.length} tone="teal" />
+        <MetricCard icon={<FileSearchOutlined />} label="已登记文档" value={documents} tone="blue" />
+        <MetricCard icon={<SafetyCertificateOutlined />} label="完成入库" value={completed} tone="green" />
+        <MetricCard icon={<WarningOutlined />} label="待处理失败任务" value={failedJobs} tone={failedJobs ? "red" : "amber"} />
+      </div>
+
+      <div className="overview-grid">
+        <section className="surface overview-section">
+          <div className="section-heading">
+            <div>
+              <Typography.Title level={4}>知识库状态</Typography.Title>
+              <Typography.Text type="secondary">按当前权限范围汇总。</Typography.Text>
+            </div>
+            <Button type="link" icon={<ArrowRightOutlined />} iconPosition="end" onClick={() => onNavigate("knowledge")}>查看知识库</Button>
+          </div>
+          <Table
+            rowKey="id"
+            loading={knowledgeBases.isLoading}
+            dataSource={accessible.slice(0, 8)}
+            pagination={false}
+            size="middle"
+            locale={{ emptyText: "暂无可访问知识库" }}
+            columns={[
+              { title: "知识库", dataIndex: "name", render: (value, row) => <div className="table-primary"><strong>{value}</strong><span>{row.description || "未填写说明"}</span></div> },
+              { title: "可用文档", width: 110, render: (_, row) => `${row.completed_file_count || 0}/${row.file_count || 0}` },
+              { title: "失败任务", dataIndex: "failed_job_count", width: 110, render: (value) => value ? <Tag color="error">{value}</Tag> : <Tag color="success">0</Tag> },
+              { title: "权限", width: 110, render: (_, row) => <Tag color={row.can_write ? "processing" : "default"}>{row.can_write ? "可维护" : "只读"}</Tag> },
+            ]}
+          />
+        </section>
+        <section className="surface overview-section attention-panel">
+          <div className="section-heading">
+            <div>
+              <Typography.Title level={4}>待关注</Typography.Title>
+              <Typography.Text type="secondary">优先处理入库失败和未完成的数据源。</Typography.Text>
+            </div>
+            <WarningOutlined className="section-heading-icon" />
+          </div>
+          {attention.length ? (
+            <div className="attention-list">
+              {attention.slice(0, 6).map((item) => (
+                <button className="attention-item" key={item.id} onClick={() => onNavigate("knowledge")}>
+                  <span className="attention-status"><WarningOutlined /></span>
+                  <span><strong>{item.name}</strong><small>{item.failed_job_count ? `${item.failed_job_count} 个失败任务` : "文档尚未完成入库"}</small></span>
+                  <ArrowRightOutlined />
+                </button>
+              ))}
+            </div>
+          ) : <EmptyText text="当前没有需要处理的知识库任务" />}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function MetricCard({ icon, label, value, tone }) {
+  return (
+    <section className={`metric-card metric-${tone}`}>
+      <span className="metric-icon">{icon}</span>
+      <div><span>{label}</span><strong>{value}</strong></div>
+    </section>
   );
 }
 
@@ -1318,95 +1431,6 @@ function UsersWorkspace({ api, user }) {
   );
 }
 
-function ApiKeyWorkspace({ api }) {
-  const queryClient = useQueryClient();
-  const [form] = Form.useForm();
-  const [secret, setSecret] = useState("");
-  const kbs = useQuery({ queryKey: ["kbs"], queryFn: async () => (await api.get("/knowledge-bases")).data.items || [] });
-  const manageableKbs = (kbs.data || []).filter(isFullAccessKb);
-  const keys = useQuery({ queryKey: ["apiKeys"], queryFn: async () => (await api.get("/api-keys")).data.items || [] });
-  const createKey = useMutation({
-    mutationFn: (values) => api.post("/api-keys", {
-      ...values,
-      expires_at: values.expires_at ? values.expires_at.toISOString() : null,
-      daily_request_limit: values.daily_request_limit || null,
-      daily_token_limit: values.daily_token_limit || null,
-      purpose: values.purpose || null,
-    }),
-    onSuccess: ({ data }) => {
-      setSecret(data.secret);
-      form.resetFields();
-      queryClient.invalidateQueries({ queryKey: ["apiKeys"] });
-    },
-    onError: (error) => message.error(readError(error)),
-  });
-  const deleteKey = useMutation({
-    mutationFn: (id) => api.delete(`/api-keys/${id}`),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["apiKeys"] });
-      message.success("API Key 已禁用");
-    },
-    onError: (error) => message.error(readError(error)),
-  });
-  function confirmDeleteKey(row) {
-    Modal.confirm({
-      title: `禁用 API Key「${row.name}」？`,
-      content: "禁用后使用该 Key 的三方项目将无法继续访问接口。",
-      okText: "禁用",
-      okButtonProps: { danger: true },
-      cancelText: "取消",
-      onOk: () => deleteKey.mutate(row.id),
-    });
-  }
-  return (
-    <section className="surface full">
-      <PageTitle title="开放接口" subtitle="为其他项目预留 OpenAI 兼容问答接口和独立检索接口，Key 绑定具体用户与知识库。" />
-      <Form form={form} layout="inline" onFinish={(values) => createKey.mutate(values)}>
-        <Form.Item name="name" rules={[{ required: true }]}><Input prefix={<KeyOutlined />} placeholder="Key 名称" /></Form.Item>
-        <Form.Item name="knowledge_base_id" rules={[{ required: true }]} className="kb-select">
-          <Select placeholder="绑定知识库" options={manageableKbs.map((item) => ({ value: item.id, label: item.name }))} />
-        </Form.Item>
-        <Form.Item name="expires_at">
-          <DatePicker
-            showTime
-            placeholder="过期时间"
-            disabledDate={(current) => current && current.endOf("day").valueOf() < Date.now()}
-          />
-        </Form.Item>
-        <Form.Item name="daily_request_limit"><InputNumber min={1} max={1000000} placeholder="每日请求" /></Form.Item>
-        <Form.Item name="daily_token_limit"><InputNumber min={1} max={100000000} placeholder="每日Token" /></Form.Item>
-        <Form.Item name="purpose"><Input placeholder="用途备注" /></Form.Item>
-        <Button type="primary" htmlType="submit" disabled={!manageableKbs.length} loading={createKey.isPending}>创建 API Key</Button>
-      </Form>
-      <Descriptions className="api-doc" bordered column={1} items={[
-        { key: "chat", label: "OpenAI 兼容", children: "POST /v1/chat/completions，Header: Authorization: Bearer rag-..." },
-        { key: "retrieval", label: "检索接口", children: "POST /v1/knowledge/{knowledge_base_id}/retrieval" },
-      ]} />
-      <Table
-        rowKey="id"
-        dataSource={keys.data || []}
-        scroll={{ x: "max-content" }}
-        columns={[
-          { title: "名称", dataIndex: "name" },
-          { title: "前缀", dataIndex: "key_prefix" },
-          { title: "状态", width: 100, render: (_, row) => <Tag color={apiKeyStatus(row).color}>{apiKeyStatus(row).text}</Tag> },
-          { title: "知识库", dataIndex: "knowledge_base_id", render: (value) => kbs.data?.find((item) => item.id === value)?.name || value?.slice(0, 8) },
-          { title: "今日请求", width: 110, render: (_, row) => quotaText(row.daily_request_count, row.daily_request_limit) },
-          { title: "今日Token", width: 120, render: (_, row) => quotaText(row.daily_token_count, row.daily_token_limit) },
-          { title: "过期时间", dataIndex: "expires_at", render: formatTime },
-          { title: "用途", dataIndex: "purpose", ellipsis: true, render: (value) => value || "-" },
-          { title: "最近使用", dataIndex: "last_used_at", render: formatTime },
-          { title: "创建时间", dataIndex: "created_at", render: formatTime },
-          { title: "操作", width: 90, render: (_, row) => <Button size="small" danger disabled={!row.is_active} icon={<DeleteOutlined />} onClick={() => confirmDeleteKey(row)} /> },
-        ]}
-      />
-      <Modal title="API Key 只显示一次" open={Boolean(secret)} footer={<Button type="primary" onClick={() => setSecret("")}>我已保存</Button>} onCancel={() => setSecret("")}>
-        <Input.TextArea value={secret} autoSize readOnly />
-      </Modal>
-    </section>
-  );
-}
-
 function AuditWorkspace({ api, user }) {
   const queryClient = useQueryClient();
   const [chatFilters, setChatFilters] = useState({ feedback_rating: "", answer_status: "", knowledge_base_id: "", low_confidence: false, no_citations: false });
@@ -1905,6 +1929,10 @@ function EmptyText({ text }) {
   return <div className="empty-text">{text}</div>;
 }
 
+function WorkspaceLoading() {
+  return <div className="workspace-loading">正在加载工作台...</div>;
+}
+
 function buildApi(token) {
   const instance = axios.create({ baseURL: API_BASE });
   instance.interceptors.request.use((config) => {
@@ -2182,18 +2210,6 @@ function taskStageText(value) {
 function scoreText(value) {
   if (value == null) return "-";
   return Number(value).toFixed(3);
-}
-
-function quotaText(count = 0, limit) {
-  return limit ? `${count || 0}/${limit}` : `${count || 0}/不限`;
-}
-
-function apiKeyStatus(row) {
-  if (!row.is_active) return { text: "禁用", color: "red" };
-  if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) return { text: "已过期", color: "orange" };
-  if (row.daily_request_limit && row.daily_request_count >= row.daily_request_limit) return { text: "请求超额", color: "red" };
-  if (row.daily_token_limit && row.daily_token_count >= row.daily_token_limit) return { text: "Token超额", color: "red" };
-  return { text: "可用", color: "green" };
 }
 
 function splitUrls(value = "") {

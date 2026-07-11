@@ -6,7 +6,11 @@ import signal
 import sys
 
 from config.settings import AppSettings
-from core.ingest_store import IngestJobCancelledError, list_recoverable_ingest_jobs
+from core.ingest_store import (
+    IngestJobCancelledError,
+    list_pending_ingest_jobs,
+    requeue_stale_running_ingest_jobs,
+)
 from core.ingestion import process_ingest_job
 from core.job_queue import record_worker_heartbeat, wait_for_ingest_job
 
@@ -27,19 +31,26 @@ async def run_worker() -> int:
         LOGGER.error("Worker configuration invalid: %s", errors)
         return 1
     LOGGER.info("Worker started")
+    last_recovery_at = 0.0
     while not STOP:
         try:
             await asyncio.to_thread(record_worker_heartbeat, settings)
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("Worker heartbeat failed: %s", exc)
+        now = asyncio.get_running_loop().time()
+        if now - last_recovery_at >= settings.worker_recovery_interval_seconds:
+            try:
+                recovered = await requeue_stale_running_ingest_jobs(
+                    settings,
+                    settings.ingest_running_stale_seconds,
+                )
+                if recovered:
+                    LOGGER.warning("Requeued %s stale ingest job(s)", recovered)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Ingest recovery scan failed: %s", exc)
+            last_recovery_at = now
         try:
             job_id = await asyncio.to_thread(wait_for_ingest_job, settings, 5)
-        except TimeoutError:
-            recoverable = await list_recoverable_ingest_jobs(settings, limit=10)
-            if recoverable:
-                job_id = recoverable[0].id
-            else:
-                continue
         except Exception as exc:  # noqa: BLE001
             if STOP:
                 break
@@ -47,7 +58,16 @@ async def run_worker() -> int:
             await asyncio.sleep(1)
             continue
         if not job_id:
-            continue
+            # Redis is only a wake-up signal. The database remains the durable source
+            # of truth, so jobs created while Redis was unavailable are still picked up.
+            try:
+                pending = await list_pending_ingest_jobs(settings, limit=1)
+                job_id = pending[0].id if pending else None
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Pending ingest job recovery failed: %s", exc)
+                continue
+            if not job_id:
+                continue
         LOGGER.info("Processing ingest job %s", job_id)
         try:
             await process_ingest_job(settings, job_id)
