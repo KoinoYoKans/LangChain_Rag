@@ -200,6 +200,7 @@ function OverviewWorkspace({ api, user, onNavigate }) {
             loading={knowledgeBases.isLoading}
             dataSource={accessible.slice(0, 8)}
             pagination={false}
+            scroll={{ x: "max-content" }}
             size="middle"
             locale={{ emptyText: "暂无可访问知识库" }}
             columns={[
@@ -246,13 +247,17 @@ function MetricCard({ icon, label, value, tone }) {
 
 function Login({ onLogin }) {
   const [loading, setLoading] = useState(false);
+  const [errorText, setErrorText] = useState("");
   async function submit(values) {
     setLoading(true);
+    setErrorText("");
     try {
       const { data } = await axios.post(`${API_BASE}/auth/login`, values);
       onLogin(data.access_token, data.user);
     } catch (error) {
-      message.error(readError(error));
+      const detail = readError(error);
+      setErrorText(detail);
+      message.error(detail);
     } finally {
       setLoading(false);
     }
@@ -261,13 +266,14 @@ function Login({ onLogin }) {
     <div className="login-screen">
       <div className="login-panel">
         <div className="login-brand"><FileSearchOutlined /> Enterprise RAG</div>
-        <Form layout="vertical" onFinish={submit}>
+        <Form layout="vertical" onFinish={submit} onValuesChange={() => setErrorText("")}>
           <Form.Item name="email" label="邮箱" rules={[{ required: true }, { type: "email", message: "请输入有效的邮箱地址" }]}>
             <Input size="large" placeholder="admin@example.com" />
           </Form.Item>
           <Form.Item name="password" label="密码" rules={[{ required: true }]}>
             <Input.Password size="large" placeholder="输入密码" />
           </Form.Item>
+          {errorText && <div className="login-error" role="alert">{errorText}</div>}
           <Button type="primary" htmlType="submit" size="large" block loading={loading}>登录</Button>
         </Form>
       </div>
@@ -318,25 +324,24 @@ function KnowledgeWorkspace({ api, user }) {
   const documentTasks = useQuery({
     queryKey: ["document-tasks", activeKb, taskStatus],
     enabled: Boolean(activeKb),
-    refetchInterval: 2500,
+    refetchInterval: (query) => hasActiveIngestWork(query.state.data) ? 2500 : false,
     queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/document-tasks`, { params: { status: taskStatus } })).data.items || [],
   });
   const activeJobs = useQuery({
     queryKey: ["jobs", activeKb, "active"],
     enabled: Boolean(activeKb),
-    refetchInterval: 2500,
+    refetchInterval: (query) => hasActiveIngestWork(query.state.data) ? 2500 : false,
     queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/ingest-jobs`, { params: { status: "active" } })).data.items || [],
   });
   const historyJobs = useQuery({
     queryKey: ["jobs", activeKb, "history"],
     enabled: Boolean(activeKb),
-    refetchInterval: 5000,
     queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/ingest-jobs`, { params: { status: "history" } })).data.items || [],
   });
   const queueHealth = useQuery({
     queryKey: ["queue-health", activeKb],
     enabled: Boolean(activeKb),
-    refetchInterval: 5000,
+    refetchInterval: (query) => (query.state.data?.pending_count || query.state.data?.running_count) ? 2500 : false,
     queryFn: async () => (await api.get(`/knowledge-bases/${activeKb}/queue-health`)).data,
   });
   useEffect(() => {
@@ -553,7 +558,7 @@ function KnowledgeWorkspace({ api, user }) {
           <Form.Item name="department_ids" label="授权部门">
             <Select mode="multiple" allowClear options={(departments.data || []).map((item) => ({ value: item.id, label: item.name }))} />
           </Form.Item>
-          <Flex gap={8}>
+          <Flex gap={8} wrap>
             <Form.Item name="retrieval_top_k" label="Top K" className="grow">
               <InputNumber min={1} max={50} placeholder="全局默认" className="full-select" />
             </Form.Item>
@@ -561,7 +566,7 @@ function KnowledgeWorkspace({ api, user }) {
               <InputNumber min={0} max={50} placeholder="全局默认" className="full-select" />
             </Form.Item>
           </Flex>
-          <Flex gap={8}>
+          <Flex gap={8} wrap>
             <Form.Item name="low_confidence_threshold" label="低可信阈值" initialValue={0.35} className="grow">
               <InputNumber min={0} max={1} step={0.05} className="full-select" />
             </Form.Item>
@@ -573,8 +578,15 @@ function KnowledgeWorkspace({ api, user }) {
         </Form>
         <div className="kb-list">
           {fullAccessKbs.map((item) => (
-            <div className={activeKb === item.id ? "kb-item active" : "kb-item"} key={item.id} onClick={() => setSelectedKb(item.id)}>
-              <Flex justify="space-between" align="start" gap={8}>
+            <div
+              className={activeKb === item.id ? "kb-item active" : "kb-item"}
+              key={item.id}
+              onClick={() => setSelectedKb(item.id)}
+              onKeyDown={(event) => activateOnKeyboard(event, () => setSelectedKb(item.id))}
+              role="button"
+              tabIndex={0}
+            >
+              <Flex justify="space-between" align="start" gap={8} wrap>
                 <div>
                   <strong>{item.name}</strong>
                   <span>{item.visibility} · TopK {item.retrieval_top_k || "全局"} · 重试 {item.low_confidence_max_retries ?? 1} · {item.completed_file_count}/{item.file_count} 文件</span>
@@ -589,7 +601,7 @@ function KnowledgeWorkspace({ api, user }) {
         </div>
       </div>
       <div className="surface main">
-        <Flex justify="space-between" align="center" gap={12}>
+        <Flex justify="space-between" align="center" gap={12} wrap>
           <PageTitle
             title={activeKbRecord ? `${activeKbRecord.name} · 文档管理` : "文档管理"}
             subtitle={activeKbRecord?.description || "支持文本、Markdown、HTML、Word、PDF 解析，PDF 可回看页文本和块定位。"}
@@ -633,7 +645,7 @@ function KnowledgeWorkspace({ api, user }) {
         </Form>
         {urlPlan && (
           <div className="import-plan">
-            <Flex justify="space-between" align="center" className="table-tools">
+            <Flex justify="space-between" align="center" className="table-tools" wrap>
               <Space wrap>
                 <Tag color="blue">总数 {urlPlan.total}</Tag>
                 <Tag color="green">可入队 {urlPlan.ready_count}</Tag>
@@ -662,7 +674,7 @@ function KnowledgeWorkspace({ api, user }) {
             />
           </div>
         )}
-        <Flex justify="space-between" align="center" className="table-tools">
+        <Flex justify="space-between" align="center" className="table-tools" wrap>
           <Typography.Title level={5}>文档处理任务中心</Typography.Title>
           <Space wrap>
             <Select
@@ -710,7 +722,7 @@ function KnowledgeWorkspace({ api, user }) {
             },
           ]}
         />
-        <Flex justify="space-between" align="center" className="table-tools">
+        <Flex justify="space-between" align="center" className="table-tools" wrap>
           <Typography.Title level={5}>文件</Typography.Title>
           <Space wrap>
             <Button disabled={!canManageKb || !selectedFileIds.length} icon={<ReloadOutlined />} onClick={() => batchReindexDocs.mutate(selectedFileIds)}>批量重建</Button>
@@ -895,7 +907,7 @@ function KnowledgeWorkspace({ api, user }) {
           <Form.Item name="department_ids" label="授权部门">
             <Select mode="multiple" allowClear options={(departments.data || []).map((item) => ({ value: item.id, label: item.name }))} />
           </Form.Item>
-          <Flex gap={8}>
+          <Flex gap={8} wrap>
             <Form.Item name="retrieval_top_k" label="Top K" className="grow">
               <InputNumber min={1} max={50} placeholder="全局默认" className="full-select" />
             </Form.Item>
@@ -903,7 +915,7 @@ function KnowledgeWorkspace({ api, user }) {
               <InputNumber min={0} max={50} placeholder="全局默认" className="full-select" />
             </Form.Item>
           </Flex>
-          <Flex gap={8}>
+          <Flex gap={8} wrap>
             <Form.Item name="low_confidence_threshold" label="低可信阈值" className="grow">
               <InputNumber min={0} max={1} step={0.05} className="full-select" />
             </Form.Item>
@@ -951,7 +963,7 @@ function JobTable({ jobs, loading, retryJob, cancelJob, selectedJobIds, setSelec
 
 function SourceDrawer({ source, onClose, onOpenPreview }) {
   return (
-    <Drawer width={520} title={source?.filename || "引用来源"} open={Boolean(source)} onClose={onClose}>
+    <Drawer rootClassName="source-drawer" width={520} title={source?.filename || "引用来源"} open={Boolean(source)} onClose={onClose}>
       {source && (
         <Space direction="vertical" size={14} className="full-select">
           <Space wrap>
@@ -988,7 +1000,7 @@ function DocumentPreview({ api, kbId, file, onClose }) {
     queryFn: async () => (await api.get(`/knowledge-bases/${kbId}/documents/${file.id}/preview`)).data,
   });
   return (
-    <Drawer width="72vw" title={file?.filename} open={Boolean(file)} onClose={onClose}>
+    <Drawer rootClassName="wide-drawer" width="72vw" title={file?.filename} open={Boolean(file)} onClose={onClose}>
       {preview.data && (
         <Tabs
           items={[
@@ -999,7 +1011,7 @@ function DocumentPreview({ api, kbId, file, onClose }) {
                 <div className="page-preview">
                   {preview.data.pages.map((page) => (
                     <article className="page-text" key={page.id}>
-                      <Flex justify="space-between">
+                      <Flex justify="space-between" wrap>
                         <strong>第 {page.page_number} 页</strong>
                         <Tag>{page.ocr_status}</Tag>
                       </Flex>
@@ -1205,7 +1217,14 @@ function ChatWorkspace({ api }) {
         <Button block className="new-chat-button" onClick={startNewConversation}>新建会话</Button>
         <div className="kb-list">
           {(conversations.data || []).map((item) => (
-            <div className={conversationId === item.id ? "conversation-item active" : "conversation-item"} key={item.id} onClick={() => openConversation(item)} role="button" tabIndex={0}>
+            <div
+              className={conversationId === item.id ? "conversation-item active" : "conversation-item"}
+              key={item.id}
+              onClick={() => openConversation(item)}
+              onKeyDown={(event) => activateOnKeyboard(event, () => openConversation(item))}
+              role="button"
+              tabIndex={0}
+            >
               <div>
                 <strong>{item.title || "未命名会话"}</strong>
                 <span>{formatTime(item.updated_at)}</span>
@@ -1231,7 +1250,7 @@ function ChatWorkspace({ api }) {
         <div className="answer-list">
           {messages.map((item) => (
             <article className="answer-item" key={item.assistant_message_id || item.user_message_id}>
-              <Flex justify="space-between" gap={12} align="start">
+              <Flex justify="space-between" gap={12} align="start" wrap>
                 <Typography.Title level={5}>{item.question}</Typography.Title>
                 <Space>
                   <Tag color={confidenceColor(item.confidence)}>{confidenceText(item.confidence, item.confidence_score)}</Tag>
@@ -1624,7 +1643,7 @@ function AuditWorkspace({ api, user }) {
                     { title: "详情", width: 80, render: (_, row) => <Button size="small" onClick={() => setChatOperation(row)}>查看</Button> },
                   ]}
                 />
-                <Drawer width="72vw" title="问答详情" open={Boolean(chatOperation)} onClose={() => setChatOperation(null)}>
+                <Drawer rootClassName="wide-drawer" width="72vw" title="问答详情" open={Boolean(chatOperation)} onClose={() => setChatOperation(null)}>
                   {chatOperation && <ChatOperationDetail row={chatOperation} />}
                 </Drawer>
               </>
@@ -1766,7 +1785,7 @@ function AuditWorkspace({ api, user }) {
           </Space>
         )}
       </Modal>
-      <Drawer width="72vw" title="处理质量待办" open={Boolean(qualityIssue)} onClose={() => setQualityIssue(null)}>
+      <Drawer rootClassName="wide-drawer" width="72vw" title="处理质量待办" open={Boolean(qualityIssue)} onClose={() => setQualityIssue(null)}>
         {qualityIssue && (
           <Space direction="vertical" className="full-select">
             <QualityIssueDetail row={qualityIssue} />
@@ -1947,6 +1966,16 @@ function refreshKnowledge(queryClient, kbId) {
   queryClient.invalidateQueries({ queryKey: ["jobs", kbId] });
   queryClient.invalidateQueries({ queryKey: ["document-tasks", kbId] });
   queryClient.invalidateQueries({ queryKey: ["queue-health", kbId] });
+}
+
+function hasActiveIngestWork(items) {
+  return Array.isArray(items) && items.some((item) => ["pending", "running", "processing"].includes(item.status));
+}
+
+function activateOnKeyboard(event, action) {
+  if (event.target !== event.currentTarget || !["Enter", " "].includes(event.key)) return;
+  event.preventDefault();
+  action();
 }
 
 function buildChatRecordsFromMessages(items) {

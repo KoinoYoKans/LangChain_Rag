@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from config.model import build_chat_model
 from config.settings import AppSettings, is_valid_cors_origin
@@ -3033,7 +3033,7 @@ def create_app() -> FastAPI:
                 metadata={"conversation_id": conversation_id, "query": request.message},
                 **request_context,
             )
-            raise HTTPException(status_code=500, detail={"message": f"问答失败：{exc}", "stage": "chat"}) from exc
+            raise public_chat_failure(exc) from exc
 
         return ChatResponse(
             conversation_id=conversation_id,
@@ -5401,6 +5401,18 @@ def safe_upload_path(upload_storage_dir: str, source_uri: str) -> Path | None:
     except ValueError:
         return None
     return path
+
+
+def public_chat_failure(exc: Exception) -> HTTPException:
+    if isinstance(exc, (IntegrityError, OperationalError)):
+        return HTTPException(
+            status_code=503,
+            detail={"message": "问答服务暂时不可用，请稍后重试。", "stage": "retrieval"},
+        )
+    return HTTPException(
+        status_code=500,
+        detail={"message": "问答处理失败，请稍后重试。", "stage": "chat"},
+    )
 
 
 def rerank_or_original(

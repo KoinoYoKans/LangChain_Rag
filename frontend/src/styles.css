@@ -298,7 +298,7 @@ body {
 
 .overview-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.65fr) minmax(320px, 0.85fr);
+  grid-template-columns: minmax(0, 1.65fr) minmax(0, 0.85fr);
   gap: 16px;
 }
 
@@ -466,10 +466,17 @@ body {
   transition: all var(--transition);
 }
 
-.kb-item:hover {
+.kb-item:hover,
+.kb-item:focus-visible {
   border-color: var(--primary-light);
   background: var(--primary-bg);
   box-shadow: var(--shadow-sm);
+}
+
+.kb-item:focus-visible,
+.conversation-item:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .kb-item.active {
@@ -559,7 +566,8 @@ body {
   transition: opacity var(--transition);
 }
 
-.conversation-item:hover .ant-btn {
+.conversation-item:hover .ant-btn,
+.conversation-item:focus-within .ant-btn {
   opacity: 1;
 }
 
@@ -613,7 +621,7 @@ body {
 /* ===== Queue Health ===== */
 .queue-health {
   display: grid;
-  grid-template-columns: repeat(6, minmax(90px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   gap: 8px;
   margin-bottom: 16px;
 }
@@ -896,6 +904,16 @@ body {
   color: var(--text);
 }
 
+.login-error {
+  margin: -4px 0 16px;
+  border-left: 3px solid var(--danger);
+  padding: 8px 10px;
+  color: #a9322d;
+  background: #fff2f1;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
 /* ===== API Doc ===== */
 .api-doc {
   margin: 16px 0;
@@ -1145,6 +1163,14 @@ body {
   border: none !important;
 }
 
+.wide-drawer .ant-drawer-content-wrapper {
+  width: min(72vw, 1120px) !important;
+}
+
+.source-drawer .ant-drawer-content-wrapper {
+  width: min(520px, 100vw) !important;
+}
+
 /* ===== Form ===== */
 .ant-form-item {
   margin-bottom: 16px;
@@ -1270,6 +1296,17 @@ body {
 }
 
 /* ===== Responsive ===== */
+@media (max-width: 1240px) {
+  .page-grid,
+  .overview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .page-grid > .surface.narrow {
+    max-width: none;
+  }
+}
+
 @media (max-width: 980px) {
   .app-shell {
     display: flex !important;
@@ -1313,11 +1350,16 @@ body {
 
   .grow,
   .kb-select {
-    min-width: 100%;
+    min-width: 0;
+  }
+
+  .url-form .grow,
+  .chat-form .grow {
+    width: 100%;
   }
 
   .queue-health {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   }
 
   .login-panel {
@@ -1367,6 +1409,19 @@ body {
 
   .surface {
     padding: 16px;
+  }
+
+  .grow {
+    flex-basis: 100%;
+  }
+
+  .wide-drawer .ant-drawer-content-wrapper,
+  .source-drawer .ant-drawer-content-wrapper {
+    width: 100vw !important;
+  }
+
+  .ant-drawer-body {
+    padding: 16px !important;
   }
 
   .ant-table-wrapper {
